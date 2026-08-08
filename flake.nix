@@ -33,12 +33,73 @@
         # SQLite, vodozemac's C shims).
         target = "armv7-unknown-linux-musleabihf";
         targetEnv = "ARMV7_UNKNOWN_LINUX_MUSLEABIHF";
+
+        version = "0.1.0";
+
+        # Host build. Handy for `nix run` against a local homeserver and for
+        # running the test suite outside a dev shell.
+        kmatrixd = pkgs.rustPlatform.buildRustPackage {
+          pname = "kmatrixd";
+          inherit version;
+          src = ./daemon;
+          cargoLock.lockFile = ./daemon/Cargo.lock;
+          meta = {
+            description = "On-device Matrix daemon for e-ink readers";
+            mainProgram = "kmatrixd";
+          };
+        };
+
+        # Device build: 32-bit hard-float ARM, statically linked against musl.
+        crossPkgs = pkgs.pkgsCross.armv7l-hf-multiplatform.pkgsMusl;
+        kmatrixdArmv7 = crossPkgs.rustPlatform.buildRustPackage {
+          pname = "kmatrixd-armv7";
+          inherit version;
+          src = ./daemon;
+          cargoLock.lockFile = ./daemon/Cargo.lock;
+          # A dynamically linked binary would need the device's glibc; see the
+          # note above. Force a fully static link and prove it stuck.
+          RUSTFLAGS = "-C target-feature=+crt-static";
+          doCheck = false; # host cannot execute ARM test binaries
+          # The default fixup strips debug info only (-S), leaving ~1 MB of
+          # symbols on a device where every megabyte is user storage.
+          stripAllList = [ "bin" ];
+          postInstall = ''
+            if ! "$READELF" -h "$out/bin/kmatrixd" | grep -q 'ARM'; then
+              echo "not an ARM binary" >&2; exit 1
+            fi
+            if "$READELF" -d "$out/bin/kmatrixd" 2>/dev/null | grep -q NEEDED; then
+              echo "binary is dynamically linked; it will not run on the device" >&2
+              exit 1
+            fi
+          '';
+          READELF = "${crossPkgs.stdenv.cc.bintools.bintools}/bin/${crossPkgs.stdenv.cc.targetPrefix}readelf";
+          meta.description = "kmatrixd for armv7 e-ink readers (static musl)";
+        };
+
+        # What you actually copy to a device: the ARM daemon plus the plugin.
+        bundle = pkgs.runCommand "kmatrix-${version}-armv7" { } ''
+          mkdir -p "$out/kmatrix" "$out/kmatrix.koplugin"
+          cp ${kmatrixdArmv7}/bin/kmatrixd "$out/kmatrix/kmatrixd"
+          chmod +x "$out/kmatrix/kmatrixd"
+          cp ${./plugin/kmatrix.koplugin}/*.lua "$out/kmatrix.koplugin/"
+        '';
+
+        # Single file to move onto the device over USB or scp.
+        tarball = pkgs.runCommand "kmatrix-${version}-armv7.tar.gz" { } ''
+          tar -czf "$out" -C ${bundle} --owner=0 --group=0 kmatrix kmatrix.koplugin
+        '';
       in
       {
-        # No packages.default: rustPlatform.buildRustPackage requires a
-        # committed Cargo.lock (cargoLock.lockFile / cargoHash) and this repo
-        # does not vendor one. Build via the devShell instead.
+        packages = {
+          default = bundle;
+          inherit kmatrixd bundle tarball;
+          armv7 = kmatrixdArmv7;
+        };
 
+        apps.default = {
+          type = "app";
+          program = "${kmatrixd}/bin/kmatrixd";
+        };
         # `nix fmt` hands the formatter bare paths, including directories and
         # non-Nix files, which nixfmt itself rejects. Fan out to *.nix and run
         # shfmt over the scripts in the same pass.
@@ -99,6 +160,9 @@
 
                 cargo zigbuild --release --target armv7-unknown-linux-musleabihf
                 qemu-arm ./target/armv7-unknown-linux-musleabihf/release/kmatrixd
+
+              Reproducible sandboxed build (same static binary):
+                nix build .#tarball
 
               Verify before copying to the device:
                 file <bin>   # must say "statically linked"

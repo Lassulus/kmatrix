@@ -48,37 +48,48 @@ and hands the plugin small already-decrypted records.
 The devices run a 32-bit hard-float ARM userland on glibc ~2.20 with a 4.9
 kernel. A dynamically linked build fails with `GLIBC_2.xx not found`; a static
 glibc build fails earlier still, inside `_dl_call_libc_early_init`. Static musl
-is the only link mode that works, and the toolchain is zig via
-`cargo-zigbuild` — the nixpkgs armv7 musl cross stdenv currently fails to build
-because it pulls in a cross glibc that does not compile.
+is the only link mode that works.
+
+### Flake outputs
+
+```sh
+nix build .#            # bundle: kmatrix/kmatrixd + kmatrix.koplugin/
+nix build .#tarball     # the same, as a single .tar.gz to copy to a device
+nix build .#armv7       # just the static armv7 daemon
+nix build .#kmatrixd    # host build, runs the test suite in checkPhase
+nix run   .# -- --data-dir ./scratch   # run the host daemon
+```
+
+`armv7` cross-compiles through `pkgsCross.armv7l-hf-multiplatform.pkgsMusl`
+with `-C target-feature=+crt-static`, and its `postInstall` refuses to produce
+an output that is not a statically linked ARM ELF — shipping a dynamic binary
+is the easiest way to get a device that silently does nothing. Note that
+`pkgsCross...pkgsMusl.buildPackages.gcc` does fail on current nixpkgs (it pulls
+in a cross glibc that does not compile), but `pkgsMusl.rustPlatform` does not
+go through that attribute and builds cleanly.
+
+### Dev-shell build
+
+The dev shell uses `cargo-zigbuild` instead, which is incremental and much
+faster to iterate on. Both paths produce the same 2.8 MB static binary.
 
 ```sh
 nix develop
-./scripts/package.sh
-```
+./scripts/package.sh    # build, assert static ARM ELF, strip, write dist/
 
-`package.sh` builds `daemon/` for `armv7-unknown-linux-musleabihf`, asserts via
-`file` that the result is a statically linked 32-bit ARM ELF (it refuses to
-package anything else), strips it, and writes `dist/kmatrix-armv7.tar.gz`
-containing `kmatrix/kmatrixd` and `kmatrix.koplugin/`.
-
-To build by hand inside the dev shell:
-
-```sh
+# or by hand
 cargo zigbuild --release --target armv7-unknown-linux-musleabihf \
   --manifest-path daemon/Cargo.toml
 qemu-arm daemon/target/armv7-unknown-linux-musleabihf/release/kmatrixd
 ```
 
-The flake exposes only `devShells.default`. There is no `packages.default`:
-`rustPlatform.buildRustPackage` needs a committed `Cargo.lock`, and this repo
-does not vendor one.
-
 ## Installing
 
-Unpack `dist/kmatrix-armv7.tar.gz` on the device and place the two pieces.
-Paths below use the Kindle KOReader root `/mnt/us/koreader`; substitute your
-KOReader data directory on reMarkable or Kobo.
+Unpack the tarball on the device — either `nix build .#tarball` (the result
+symlink is the `.tar.gz`) or `dist/kmatrix-armv7.tar.gz` from `package.sh` —
+and place the two pieces. Paths below use the Kindle KOReader root
+`/mnt/us/koreader`; substitute your KOReader data directory on reMarkable or
+Kobo.
 
 - `kmatrix.koplugin/` into KOReader's plugin directory:
   `/mnt/us/koreader/plugins/kmatrix.koplugin/`

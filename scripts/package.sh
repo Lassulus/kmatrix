@@ -5,6 +5,11 @@
 # host toolchain or against glibc: the devices run glibc ~2.20 on a 4.9 kernel,
 # where both a newer dynamic glibc and a static glibc fail at process start.
 # The `file` assertion below is therefore load-bearing, not decoration.
+#
+# This is the fast, incremental path via cargo-zigbuild, for iterating inside
+# `nix develop`. For a reproducible sandboxed build use the flake instead:
+#   nix build .#tarball
+# Both produce the same static binary.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
