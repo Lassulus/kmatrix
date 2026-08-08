@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS room (
     encrypted    INTEGER NOT NULL,
     unread       INTEGER NOT NULL,
     last_ts      INTEGER NOT NULL,
-    last_preview TEXT NOT NULL
+    last_preview TEXT NOT NULL,
+    -- Backwards-pagination edge: how far into the room's history we have
+    -- walked. Seeded once from the first `prev_batch` sync reports for the
+    -- room, then only ever moved further back by /messages?dir=b. Never
+    -- touched by a room upsert, so a later sync cannot skip history.
+    back_token   TEXT,
+    back_done    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS message (
     event_id  TEXT PRIMARY KEY,
@@ -168,6 +174,10 @@ impl Store {
 
     // ---------------------------------------------------------------- rooms
 
+    /// Writes only the columns sync owns. `back_token` and `back_done` are
+    /// deliberately absent from both the insert list and the conflict update:
+    /// sync upserts a room on every round, and including them would reset the
+    /// pagination edge to NULL each time, losing the backfill progress.
     pub fn upsert_room(&self, r: &Room) -> Result<()> {
         self.conn
             .execute(
@@ -241,6 +251,60 @@ impl Store {
             )
             .optional()
             .with_context(|| format!("get room {id}"))
+    }
+
+    // ------------------------------------------------- backwards pagination
+
+    /// The room's backwards-pagination edge as `(token, done)`.
+    ///
+    /// `None` means no `prev_batch` has ever been recorded for the room, so
+    /// there is nowhere to page back from yet. `done` is set once the server
+    /// has told us we reached the start of the room. An unknown room reads as
+    /// `(None, false)`.
+    pub fn back_token(&self, room: &str) -> Result<(Option<String>, bool)> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT back_token, back_done FROM room WHERE id = ?1",
+                params![room],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .with_context(|| format!("read back token for {room}"))?;
+        Ok(row.unwrap_or((None, false)))
+    }
+
+    /// Record the first `prev_batch` we ever saw for a room, and only that
+    /// one: returns `true` when it was written, `false` when a token was
+    /// already there. Every later sync reports a `prev_batch` pointing at a
+    /// *newer* position, so overwriting would jump the edge forward and skip
+    /// the history in between.
+    ///
+    /// The room row is written by [`Store::upsert_room`] first; seeding a room
+    /// the store has never seen writes nothing and returns `false`.
+    pub fn seed_back_token(&self, room: &str, token: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE room SET back_token = ?2
+                 WHERE id = ?1 AND back_token IS NULL",
+                params![room, token],
+            )
+            .with_context(|| format!("seed back token for {room}"))?;
+        Ok(n > 0)
+    }
+
+    /// Move the walking edge to where the last `/messages?dir=b` page ended.
+    /// `done` marks that the start of the room has been reached, which is what
+    /// a missing `end` token or an empty chunk means.
+    pub fn set_back_token(&self, room: &str, token: Option<&str>, done: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE room SET back_token = ?2, back_done = ?3 WHERE id = ?1",
+                params![room, token, done as i64],
+            )
+            .with_context(|| format!("set back token for {room}"))?;
+        Ok(())
     }
 
     // ------------------------------------------------------------- messages
@@ -401,19 +465,35 @@ impl Store {
 /// after a release have to be bolted on by hand — a device holding thousands of
 /// messages cannot afford to have the table dropped and rebuilt.
 fn migrate(conn: &Connection) -> Result<()> {
-    let mut present: Vec<String> = Vec::new();
-    conn.pragma(None, "table_info", "message", |row| {
-        present.push(row.get(1)?);
-        Ok(())
-    })
-    .context("inspect message columns")?;
+    // (table, column, declaration). Grouped by table so each one is inspected
+    // once; a fresh database created from SCHEMA already has every column and
+    // this whole pass is a no-op.
+    const ADDED: [(&str, &[(&str, &str)]); 2] = [
+        ("message", &[("session_id", "TEXT"), ("ciphertext", "TEXT")]),
+        (
+            "room",
+            &[
+                ("back_token", "TEXT"),
+                ("back_done", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        ),
+    ];
 
-    for column in ["session_id", "ciphertext"] {
-        if present.iter().any(|c| c == column) {
-            continue;
+    for (table, columns) in ADDED {
+        let mut present: Vec<String> = Vec::new();
+        conn.pragma(None, "table_info", table, |row| {
+            present.push(row.get(1)?);
+            Ok(())
+        })
+        .with_context(|| format!("inspect {table} columns"))?;
+
+        for (column, decl) in columns {
+            if present.iter().any(|c| c == column) {
+                continue;
+            }
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+                .with_context(|| format!("add {table} column {column}"))?;
         }
-        conn.execute_batch(&format!("ALTER TABLE message ADD COLUMN {column} TEXT;"))
-            .with_context(|| format!("add message column {column}"))?;
     }
     Ok(())
 }
@@ -847,8 +927,12 @@ mod tests {
         let tmp = TempDb::new();
         let store = tmp.open();
 
-        store.insert_message(&retryable("$evt", 100)).expect("insert");
-        store.insert_message(&retryable("$keep", 90)).expect("insert");
+        store
+            .insert_message(&retryable("$evt", 100))
+            .expect("insert");
+        store
+            .insert_message(&retryable("$keep", 90))
+            .expect("insert");
 
         store
             .upgrade_message("$evt", "recovered from the backup")
@@ -924,5 +1008,186 @@ mod tests {
             .expect("limited");
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].0, "$b");
+    }
+
+    /// A room as sync writes it; the pagination columns are never part of it.
+    fn room(name: &str, unread: u32, last_ts: u64) -> Room {
+        Room {
+            id: "!r:example.org".into(),
+            name: name.into(),
+            encrypted: true,
+            unread,
+            last_ts,
+            last_preview: "hi".into(),
+        }
+    }
+
+    #[test]
+    fn back_token_defaults_to_unseeded() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        // A room the store has never seen.
+        assert_eq!(
+            store.back_token("!nope:example.org").expect("unknown room"),
+            (None, false)
+        );
+
+        store.upsert_room(&room("Room", 0, 10)).expect("upsert");
+        assert_eq!(
+            store.back_token("!r:example.org").expect("fresh room"),
+            (None, false),
+            "a freshly synced room has no pagination edge yet"
+        );
+    }
+
+    #[test]
+    fn seed_back_token_writes_only_once() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+        store.upsert_room(&room("Room", 0, 10)).expect("upsert");
+
+        assert!(
+            store
+                .seed_back_token("!r:example.org", "t_first")
+                .expect("first seed"),
+            "the first prev_batch must be recorded"
+        );
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read"),
+            (Some("t_first".to_string()), false)
+        );
+
+        // A later sync reports a newer prev_batch; taking it would skip the
+        // history between the two positions.
+        assert!(
+            !store
+                .seed_back_token("!r:example.org", "t_later")
+                .expect("second seed"),
+            "an existing edge must not be reseeded"
+        );
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read again"),
+            (Some("t_first".to_string()), false)
+        );
+
+        // Nothing to seed for a room that was never upserted.
+        assert!(!store
+            .seed_back_token("!missing:example.org", "t")
+            .expect("seed unknown room"));
+    }
+
+    #[test]
+    fn set_back_token_walks_the_edge_and_marks_done() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+        store.upsert_room(&room("Room", 0, 10)).expect("upsert");
+        store
+            .seed_back_token("!r:example.org", "t_first")
+            .expect("seed");
+
+        store
+            .set_back_token("!r:example.org", Some("t_page1"), false)
+            .expect("first page");
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read"),
+            (Some("t_page1".to_string()), false)
+        );
+
+        // The server ran out of history: no end token, start of room reached.
+        store
+            .set_back_token("!r:example.org", None, true)
+            .expect("exhausted");
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read done"),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn upsert_room_does_not_clobber_the_pagination_edge() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+        store.upsert_room(&room("Room", 0, 10)).expect("upsert");
+        store
+            .seed_back_token("!r:example.org", "t_edge")
+            .expect("seed");
+        store
+            .set_back_token("!r:example.org", Some("t_edge"), true)
+            .expect("mark done");
+
+        // Sync upserts the room again with fresh metadata, as it does every
+        // round.
+        store
+            .upsert_room(&room("Renamed", 7, 99))
+            .expect("re-upsert");
+
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read"),
+            (Some("t_edge".to_string()), true),
+            "sync must not reset backfill progress"
+        );
+        let got = store
+            .get_room("!r:example.org")
+            .expect("get room")
+            .expect("room present");
+        assert_eq!(got.name, "Renamed");
+        assert_eq!(got.unread, 7);
+        assert_eq!(got.last_ts, 99);
+    }
+
+    #[test]
+    fn migration_adds_the_pagination_columns_to_an_old_database() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create db directory");
+        }
+
+        // A `room` table as written by a build that predates backfill.
+        {
+            let conn = Connection::open(&path).expect("open raw connection");
+            conn.execute_batch(
+                "CREATE TABLE room (
+                     id           TEXT PRIMARY KEY,
+                     name         TEXT NOT NULL,
+                     encrypted    INTEGER NOT NULL,
+                     unread       INTEGER NOT NULL,
+                     last_ts      INTEGER NOT NULL,
+                     last_preview TEXT NOT NULL
+                 );
+                 INSERT INTO room VALUES ('!r:example.org', 'Room', 1, 3, 10, 'hi');",
+            )
+            .expect("create pre-migration schema");
+        }
+
+        // Opening migrates in place: the row survives and the columns work.
+        let store = tmp.open();
+        let rooms = store.list_rooms().expect("list rooms");
+        assert_eq!(rooms.len(), 1, "migration must not drop or duplicate rows");
+        assert_eq!(rooms[0].name, "Room");
+        assert_eq!(
+            store.back_token("!r:example.org").expect("read"),
+            (None, false),
+            "the migrated column defaults to unseeded"
+        );
+
+        assert!(store
+            .seed_back_token("!r:example.org", "t_first")
+            .expect("seed"));
+        store
+            .set_back_token("!r:example.org", Some("t_page1"), true)
+            .expect("walk");
+
+        // Idempotent: a second open finds both columns and leaves them alone.
+        drop(store);
+        let store = tmp.open();
+        assert_eq!(
+            store
+                .back_token("!r:example.org")
+                .expect("read after reopen"),
+            (Some("t_page1".to_string()), true)
+        );
+        assert_eq!(store.list_rooms().expect("list after reopen").len(), 1);
     }
 }

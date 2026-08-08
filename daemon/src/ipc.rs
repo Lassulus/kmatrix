@@ -132,9 +132,17 @@ fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
         let env: Envelope = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(e) => {
+                // Recover the id even though the command did not parse.
+                // Clients match responses to requests by id, so answering
+                // with a placeholder id leaves the caller waiting forever —
+                // an unknown command must fail the request, not wedge it.
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+                    .unwrap_or(0);
                 reply(
                     &mut writer,
-                    &json!({"id": 0, "ok": false, "error": format!("bad request: {e}")}),
+                    &json!({"id": id, "ok": false, "error": format!("bad request: {e}")}),
                 )?;
                 continue;
             }
@@ -287,6 +295,13 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
             json!({"id": id, "ok": true})
         }
 
+
+        Request::LoadOlder { room, limit } => match crate::do_load_older(sh, &room, limit) {
+            Ok((added, exhausted)) => {
+                json!({"id": id, "ok": true, "added": added, "exhausted": exhausted})
+            }
+            Err(e) => err(id, e),
+        },
 
         Request::VerifyConfirm {
             transaction,

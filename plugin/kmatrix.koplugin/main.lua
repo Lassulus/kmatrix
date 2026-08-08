@@ -32,6 +32,12 @@ local DAEMON_POLL_TRIES = 20     -- ~10 s before giving up
 
 local MESSAGE_LIMIT = 100
 
+-- Backfill: how many events the daemon fetches per /messages page, and the
+-- ceiling on how much of that history the timeline keeps on screen -- every
+-- row costs memory on a device that has a few megabytes to spare.
+local BACKFILL_LIMIT = 50
+local MESSAGE_WINDOW_MAX = 500
+
 local STATE_LABELS = {
     logged_out = _("Logged out"),
     connecting = _("Connecting…"),
@@ -751,6 +757,14 @@ function KMatrix:messageItems()
     local items = {}
     local timeline = self.timeline
     if not timeline then return items end
+    if not timeline.exhausted then
+        -- Synthetic first row: history older than the sync window is fetched
+        -- on demand, so the top of the list is a button, not a message.
+        items[1] = {
+            text = "\u{2191} " .. _("Load older messages"), -- 'upwards arrow'
+            is_load_older = true,
+        }
+    end
     for i = 1, #timeline.messages do
         local message = timeline.messages[i]
         local sender = message.mine and _("Me") or shortSender(message.sender)
@@ -758,12 +772,13 @@ function KMatrix:messageItems()
         if message.encrypted and not message.decrypted then
             body = "\u{f023} " .. body -- 'lock' sign: could not be decrypted
         end
-        items[i] = {
+        items[#items + 1] = {
             text = sender .. ": " .. body,
             mandatory = clockOf(message.ts),
             bold = message.mine or nil,
             body = body,
             header = sender .. "  ·  " .. dateTimeOf(message.ts),
+            event_id = message.event_id, -- anchor for a position-keeping refresh
         }
     end
     return items
@@ -775,6 +790,9 @@ function KMatrix:openTimeline(room_id, room_name)
         name = room_name,
         messages = {},
         seen = {},
+        window = MESSAGE_LIMIT, -- messages asked of the daemon; backfill grows it
+        exhausted = false,      -- true once the start of the room is reached
+        loading_older = false,
     }
     local menu = Menu:new{
         title = room_name,
@@ -790,7 +808,11 @@ function KMatrix:openTimeline(room_id, room_name)
             self:showComposer()
         end,
         onMenuSelect = function(menu_self, item) -- luacheck: ignore menu_self
-            self:showFullMessage(item)
+            if item.is_load_older then
+                self:loadOlderMessages()
+            else
+                self:showFullMessage(item)
+            end
             return true
         end,
         close_callback = function()
@@ -802,9 +824,15 @@ function KMatrix:openTimeline(room_id, room_name)
     self:requestMessages(room_id)
 end
 
-function KMatrix:requestMessages(room_id)
+--- Asks for the newest messages of a room. `limit` defaults to the timeline's
+-- current window, so an incidental refresh never shrinks history that backfill
+-- already widened. With `keep_page` the reading position survives the repaint.
+function KMatrix:requestMessages(room_id, limit, keep_page)
     if not self:isConnected() then return end
-    self.ipc:request("messages", { room = room_id, limit = MESSAGE_LIMIT }, function(resp)
+    local window = limit
+        or (self.timeline and self.timeline.room == room_id and self.timeline.window)
+        or MESSAGE_LIMIT
+    self.ipc:request("messages", { room = room_id, limit = window }, function(resp)
         if not resp.ok then
             self:notify(T(_("Could not load messages: %1"), tostring(resp.error)))
             return
@@ -812,12 +840,58 @@ function KMatrix:requestMessages(room_id)
         if not self.timeline or self.timeline.room ~= resp.room then return end
         self.timeline.messages = {}
         self.timeline.seen = {}
-        self:appendMessages(resp.messages or {})
+        self:appendMessages(resp.messages or {}, keep_page)
+    end)
+end
+
+--- Walks the room's history one /messages page further back. The daemon stores
+-- what it fetches -- upgrading rows it already had, ciphertext included -- so
+-- nothing is merged here: the window is simply re-read afterwards, which is
+-- also what makes placeholders the backfill decrypted appear.
+function KMatrix:loadOlderMessages()
+    local timeline = self.timeline
+    if not timeline or timeline.loading_older then return end
+    if not self:daemonReady() then return end
+    if timeline.window >= MESSAGE_WINDOW_MAX then
+        -- Fetching pages the timeline cannot show would only cost memory.
+        self:notify(T(_("The timeline shows the most recent %1 messages; that is as far back as it goes."),
+            MESSAGE_WINDOW_MAX), 5)
+        return
+    end
+    local room = timeline.room
+    timeline.loading_older = true
+    self:setBusy(_("Loading older messages…"))
+    self.ipc:request("load_older", { room = room, limit = BACKFILL_LIMIT }, function(resp)
+        self:clearBusy()
+        timeline.loading_older = false
+        if not resp.ok then
+            -- The daemon words the failure (no history token yet, HTTP status,
+            -- …), and which one it is decides what the user can do about it.
+            self:notify(resp.error and tostring(resp.error)
+                or _("Could not load older messages."), 5)
+            return
+        end
+        if self.timeline ~= timeline then return end -- the room closed meanwhile
+        local added = tonumber(resp.added) or 0
+        timeline.exhausted = resp.exhausted == true
+        if added == 0 then
+            if timeline.exhausted then
+                self:notify(_("No older messages."))
+                self:refreshTimeline(true) -- the row has nothing left to load
+                return
+            end
+            -- The page held only events we had already stored, but backfill may
+            -- have upgraded them, so re-read rather than merely repaint.
+            self:requestMessages(room, timeline.window, true)
+            return
+        end
+        timeline.window = math.min(timeline.window + added, MESSAGE_WINDOW_MAX)
+        self:requestMessages(room, timeline.window, true)
     end)
 end
 
 --- Adds messages we have not seen yet (the daemon may resend on overlap).
-function KMatrix:appendMessages(messages)
+function KMatrix:appendMessages(messages, keep_page)
     local timeline = self.timeline
     if not timeline then return end
     local added = false
@@ -831,16 +905,44 @@ function KMatrix:appendMessages(messages)
         end
     end
     if not added then return end
-    self:refreshTimeline()
+    self:refreshTimeline(keep_page)
     self:markRead()
 end
 
---- Repaints the timeline and keeps the newest message on screen.
-function KMatrix:refreshTimeline()
+--- Event id of the topmost message row on the menu's current page: the anchor a
+-- prepending refresh scrolls back to. nil when the page carries no message row
+-- (only the synthetic "load older" one).
+local function topEventId(menu)
+    local page_items = menu.page_items and menu.page_items[menu.page or 1]
+    if not page_items then return nil end
+    local item_table = menu.item_table or {}
+    for i = 1, #page_items do
+        local item = item_table[page_items[i]]
+        if item and item.event_id then return item.event_id end
+    end
+    return nil
+end
+
+local function indexOfEvent(items, event_id)
+    for i = 1, #items do
+        if items[i].event_id == event_id then return i end
+    end
+    return nil
+end
+
+--- Repaints the timeline. Normally the newest message is brought on screen;
+-- with `keep_page` the row that was at the top of the visible page stays there,
+-- which is what backfill needs: it prepends rows above the reader's position,
+-- so the page number on its own no longer points at the same place.
+function KMatrix:refreshTimeline(keep_page)
     local timeline = self.timeline
     if not timeline then return end
-    local items = self:messageItems()
     local menu = timeline.menu
+    local anchor
+    if keep_page then
+        anchor = topEventId(menu)
+    end
+    local items = self:messageItems()
     -- Do NOT pass an itemnumber here. With items_max_lines set,
     -- switchItemTable resolves the page via Menu:getPageNumber(), which walks
     -- self.page_items -- but page_items is only rebuilt later, by
@@ -850,7 +952,19 @@ function KMatrix:refreshTimeline()
     -- never page < 1, so the menu renders page 0: blank, i.e. "No items".
     -- The room list dodged this by passing -1 (keep current page).
     menu:switchItemTable(nil, items)
-    if #items > 0 and (menu.page_num or 1) > 1 then
+    if #items == 0 then return end
+    if keep_page then
+        -- That switchItemTable rebuilt page_items for the new table, so
+        -- getPageNumber() now resolves against the prepended rows.
+        local index = anchor and indexOfEvent(items, anchor)
+        if index then
+            menu:onGotoPage(menu:getPageNumber(index))
+        end
+        -- Without an anchor the page held no message anyway, and page 1 -- where
+        -- switchItemTable just left us -- is the older end of the timeline.
+        return
+    end
+    if (menu.page_num or 1) > 1 then
         menu:onLastPage() -- newest message sits at the bottom
     end
 end

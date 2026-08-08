@@ -382,6 +382,12 @@ fn process_sync(
                 db.insert_message(m)?;
             }
             db.upsert_room(&room)?;
+            // Seed the backwards-pagination edge the first time we see this
+            // room, and only then: a later `limited` sync's prev_batch points
+            // at a newer position, so adopting it would silently skip history.
+            if let Some(prev) = jr.timeline.prev_batch.as_deref() {
+                db.seed_back_token(&room_id, prev)?;
+            }
         }
 
         if !msgs.is_empty() {
@@ -1054,4 +1060,59 @@ fn handle_secret(
             let _ = api.send_to_device("m.secret.request", &txn, &messages);
         }
     }
+}
+
+// --------------------------------------------------------------- backfill
+
+/// Fetch one page of older history for a room.
+///
+/// `/sync` never revisits the past, so this is the only source of events
+/// older than the window we first saw — and the only way to obtain the
+/// ciphertext of the placeholders stored before ciphertext retention existed.
+/// Returns (messages stored, reached the start of the room).
+pub fn do_load_older(sh: &Arc<Shared>, room: &str, limit: u32) -> Result<(usize, bool)> {
+    let api = sh.api().ok_or_else(|| anyhow!("not logged in"))?;
+    let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
+
+    let (token, done) = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.back_token(room)?
+    };
+    if done {
+        return Ok((0, true));
+    }
+    // No token means this room has not appeared in a sync batch since we
+    // logged in — very common, since incremental syncs only carry rooms with
+    // new activity. Omitting `from` starts the server at the newest visible
+    // event (Matrix v1.3+), which is exactly where we want to begin.
+    let page = api.messages(room, token.as_deref(), limit)?;
+    let exhausted = page.end.is_none() || page.chunk.is_empty();
+
+    let mut stored = 0usize;
+    for ev in &page.chunk {
+        if let Some(m) = convert_event(sh, room, ev, &session)? {
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            db.insert_message(&m)?;
+            stored += 1;
+        }
+    }
+
+    {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.set_back_token(room, page.end.as_deref(), exhausted)?;
+    }
+
+    // Freshly fetched ciphertext is exactly what the key backup can unlock,
+    // so try immediately rather than making the user open the room twice.
+    try_restore_room(sh, room);
+
+    if stored > 0 {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let msgs = db.recent_messages(room, limit.max(50))?;
+        drop(db);
+        sh.bus.publish(&serde_json::json!({
+            "event": "messages", "room": room, "messages": msgs
+        }));
+    }
+    Ok((stored, exhausted))
 }

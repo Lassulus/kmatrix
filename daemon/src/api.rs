@@ -20,7 +20,7 @@ use ureq::http::Response;
 use ureq::typestate::{WithBody, WithoutBody};
 use ureq::{Agent, Body, RequestBuilder};
 
-use crate::model::{Session, SyncResponse, CLIENT_VERSION, SYNC_FILTER};
+use crate::model::{RoomEvent, Session, SyncResponse, CLIENT_VERSION, SYNC_FILTER};
 
 /// Ceiling for a normal request. Generous because EDGE/2.4GHz-on-a-Kindle is
 /// slow, but bounded so a wedged server cannot hang the daemon forever.
@@ -112,6 +112,21 @@ struct BackupVersionResponse {
 struct BackupAuthData {
     public_key: String,
 }
+
+/// A page of room history from `/messages`.
+#[derive(Deserialize)]
+pub struct Page {
+    /// Events, newest first when paging backwards.
+    #[serde(default)]
+    pub chunk: Vec<RoomEvent>,
+    /// Token for the next page further back. Absent at the start of the room.
+    #[serde(default)]
+    pub end: Option<String>,
+}
+
+/// Same shape as the sync filter's room section: skip bulk membership, which
+/// is the bulk of a backfill page and which we never render.
+const MESSAGES_FILTER: &str = r#"{"lazy_load_members":true}"#;
 
 // ---------------------------------------------------------------------- impl
 
@@ -325,6 +340,33 @@ impl Api {
         }
         let parsed: serde_json::Value = finish(res, "backup_session")?;
         Ok(Some(parsed))
+    }
+
+    /// Page backwards through a room's history.
+    ///
+    /// `/sync` only moves forward and hands us a fixed window, so this is the
+    /// only way to see anything older — and the only way to recover the
+    /// ciphertext of encrypted events stored as placeholders before we began
+    /// retaining it.
+    ///
+    /// `from` is optional since Matrix v1.3: without it the server starts at
+    /// the most recent visible event. That matters here, because a room only
+    /// gets a `prev_batch` when it appears in a sync batch, so rooms that have
+    /// been quiet since we logged in would otherwise have no way in.
+    pub fn messages(&self, room: &str, from: Option<&str>, limit: u32) -> Result<Page> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/rooms/{}/messages",
+            encode_segment(room)
+        ));
+        let mut req = self
+            .get_auth(&url)?
+            .query("dir", "b")
+            .query("limit", limit.to_string())
+            .query("filter", MESSAGES_FILTER);
+        if let Some(from) = from {
+            req = req.query("from", from);
+        }
+        finish(req.call()?, "messages")
     }
 
     // ------------------------------------------------------------- internals

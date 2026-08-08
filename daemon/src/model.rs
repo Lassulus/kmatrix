@@ -117,6 +117,12 @@ pub enum Request {
         event_id: String,
     },
     SyncNow,
+    /// Page one screenful of older history into the store.
+    LoadOlder {
+        room: String,
+        #[serde(default = "default_backfill")]
+        limit: u32,
+    },
     /// Supply the server-side key-backup recovery key ("Security Key"), so
     /// history predating this device can be decrypted on demand.
     BackupKey {
@@ -128,6 +134,10 @@ pub enum Request {
         confirm: bool,
     },
     Shutdown,
+}
+
+fn default_backfill() -> u32 {
+    50
 }
 
 fn default_limit() -> u32 {
