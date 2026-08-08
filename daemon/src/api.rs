@@ -29,6 +29,11 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Connect (DNS + TCP + TLS) budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `.well-known` discovery is best-effort and must not stall login. A server
+/// advertising an unroutable base (Conduit's default) otherwise burns the full
+/// connect budget before we fall back.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Slack added on top of the server-side long-poll window for `/sync`.
 const SYNC_SLACK: Duration = Duration::from_secs(60);
 
@@ -365,9 +370,26 @@ fn normalize_base(input: &str) -> Result<String> {
 /// other than 200 is a discovery failure). Skipping this is not academic —
 /// Conduit advertises `https://<server_name>` by default, so a homeserver
 /// reachable on `http://host:6167` would otherwise send us to a dead port 443.
+///
+/// Both requests are bounded by `DISCOVERY_TIMEOUT` rather than the normal
+/// per-call timeout. Discovery is best-effort, but a homeserver that
+/// advertises an unroutable base (Conduit's default `https://<server_name>`)
+/// makes the validation probe hang until it times out, and on a device that
+/// turns "log in" into a minute of nothing. Fail fast and keep the base the
+/// user typed.
 fn discover(agent: &Agent, base: &str) -> Option<String> {
-    let url = format!("{base}/.well-known/matrix/client");
-    let mut res = agent.get(&url).call().ok()?;
+    let get = |url: String| {
+        agent
+            .get(url)
+            .config()
+            .timeout_per_call(Some(DISCOVERY_TIMEOUT))
+            .timeout_connect(Some(DISCOVERY_TIMEOUT))
+            .build()
+            .call()
+            .ok()
+    };
+
+    let mut res = get(format!("{base}/.well-known/matrix/client"))?;
     if res.status().as_u16() != 200 {
         return None;
     }
@@ -377,10 +399,7 @@ fn discover(agent: &Agent, base: &str) -> Option<String> {
     if candidate == base {
         return None;
     }
-    let probe = agent
-        .get(format!("{candidate}/_matrix/client/versions"))
-        .call()
-        .ok()?;
+    let probe = get(format!("{candidate}/_matrix/client/versions"))?;
     if probe.status().as_u16() == 200 {
         Some(candidate)
     } else {

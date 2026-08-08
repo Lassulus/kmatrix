@@ -73,6 +73,11 @@ impl Store {
             .context("set journal mode")?;
         conn.execute_batch("PRAGMA synchronous = NORMAL;")
             .context("set synchronous mode")?;
+        // This file holds an access token and Olm/Megolm pickles. Without
+        // secure_delete SQLite only unlinks freed pages, leaving the plaintext
+        // readable in the file after logout.
+        conn.execute_batch("PRAGMA secure_delete = ON;")
+            .context("enable secure delete")?;
         // Equivalent to `PRAGMA busy_timeout = 5000`, without the result row.
         conn.busy_timeout(Duration::from_millis(5000))
             .context("set busy timeout")?;
@@ -109,7 +114,28 @@ impl Store {
                  DELETE FROM pickle;
                  COMMIT;",
             )
-            .context("clear store")
+            .context("clear store")?;
+        // DELETE only frees pages; the file never shrinks on its own. VACUUM
+        // rebuilds it compactly -- but in WAL mode the rebuilt pages land in
+        // the WAL, so the *old* pages (with the access token) stay in the main
+        // file until a checkpoint folds the new ones in. Order matters:
+        // vacuum, then checkpoint. Measured on a real Kindle at 667 KB of WAL
+        // against a 4 KB database.
+        self.conn.execute_batch("VACUUM;").context("vacuum store")?;
+        self.checkpoint()
+    }
+
+    /// Fold the write-ahead log back into the database and truncate it.
+    /// SQLite never shrinks a WAL on its own, so a long-lived daemon on flash
+    /// storage has to ask.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })
+            .context("wal checkpoint")
     }
 
     // ----------------------------------------------------------------- meta
@@ -301,6 +327,10 @@ mod tests {
             }
         }
 
+        fn path(&self) -> PathBuf {
+            self.dir.join("store.db")
+        }
+
         fn open(&self) -> Store {
             match Store::open(&self.dir.join("store.db")) {
                 Ok(s) => s,
@@ -403,6 +433,52 @@ mod tests {
             .expect("recent")
             .is_empty());
         assert!(store.all_pickles("account").expect("pickles").is_empty());
+    }
+
+    /// Logout must not leave the access token recoverable in the write-ahead
+    /// log, and must not leave the WAL occupying device flash. Measured on a
+    /// real Kindle: 667 KB of WAL against a 4 KB database before this.
+    #[test]
+    fn clear_truncates_the_wal_and_leaves_no_token() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .save_session(&Session {
+                homeserver: "https://example.org".into(),
+                user_id: "@alice:example.org".into(),
+                device_id: "DEV1".into(),
+                access_token: "syt_supersecret_token".into(),
+            })
+            .expect("save session");
+        for i in 0..500 {
+            store
+                .insert_message(&msg(&format!("$e{i}"), i as u64, "padding padding", true))
+                .expect("insert");
+        }
+        let db = tmp.path();
+        let wal = db.with_file_name("store.db-wal");
+        let shm = db.with_file_name("store.db-shm");
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "expected a non-empty WAL to have built up");
+
+        store.clear().expect("clear");
+
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(after < before, "WAL did not shrink: {before} -> {after}");
+
+        // The token must not survive anywhere in the on-disk files.
+        for p in [db, wal, shm] {
+            if let Ok(bytes) = std::fs::read(&p) {
+                assert!(
+                    !bytes
+                        .windows(b"syt_supersecret_token".len())
+                        .any(|w| w == b"syt_supersecret_token"),
+                    "access token still present in {}",
+                    p.display()
+                );
+            }
+        }
     }
 
     #[test]

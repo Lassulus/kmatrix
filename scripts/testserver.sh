@@ -17,7 +17,10 @@ DB_DIR="$DATA_DIR/db"
 PIDFILE="$DATA_DIR/conduit.pid"
 LOGFILE="$DATA_DIR/conduit.log"
 
-HOST="127.0.0.1"
+# Loopback by default. Set KMATRIX_TESTSERVER_HOST to a LAN address to test
+# from a real device -- note that exposes an open-registration homeserver to
+# the network, so bind a specific interface and stop it when you are done.
+HOST="${KMATRIX_TESTSERVER_HOST:-127.0.0.1}"
 PORT="6167"
 BASE="http://$HOST:$PORT"
 START_TIMEOUT="${KMATRIX_TESTSERVER_TIMEOUT:-60}"

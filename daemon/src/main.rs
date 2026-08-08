@@ -335,10 +335,15 @@ fn process_sync(
         changed_rooms.push(room);
     }
 
-    // 3. Persist the token only after the batch is durably stored.
+    // 3. Persist the token only after the batch is durably stored, then fold
+    //    the WAL back in. SQLite never shrinks a WAL by itself and this daemon
+    //    runs for days on flash storage, so an unbounded WAL is a slow leak.
     {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         db.set_meta("sync_token", &resp.next_batch)?;
+        if let Err(e) = db.checkpoint() {
+            eprintln!("kmatrixd: wal checkpoint: {e:#}");
+        }
     }
 
     // 4. Keep one-time keys topped up.
