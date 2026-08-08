@@ -122,6 +122,11 @@ pub enum Request {
     BackupKey {
         key: String,
     },
+    /// Answer to the emoji comparison shown during device verification.
+    VerifyConfirm {
+        transaction: String,
+        confirm: bool,
+    },
     Shutdown,
 }
 

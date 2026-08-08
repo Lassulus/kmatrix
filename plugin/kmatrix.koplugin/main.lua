@@ -10,6 +10,7 @@ UI thread never blocks on the network.
 --]]
 
 local ButtonDialog = require("ui/widget/buttondialog")
+local Font = require("ui/font")
 local IPC = require("ipc")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
@@ -71,6 +72,7 @@ function KMatrix:init()
     self.busy_msg = nil
     self.room_menu = nil
     self.timeline = nil
+    self.verify_dialog = nil
     self.rooms = {}
     self.state = nil
     self.user_id = nil
@@ -205,6 +207,7 @@ function KMatrix:pollForDaemon(tries, done)
 end
 
 function KMatrix:teardownConnection()
+    self:closeVerification()
     if self.start_poll then
         UIManager:unschedule(self.start_poll)
         self.start_poll = nil
@@ -462,6 +465,128 @@ function KMatrix:refreshVisibleView()
     end
 end
 
+--[[ Device verification ]]--
+
+--- Composes the emoji comparison text.
+-- The pictographs are not guaranteed to exist in KOReader's fonts, so the
+-- English descriptions carry the comparison and the glyph is decoration only:
+-- a column of missing-glyph boxes still leaves a readable, ordered word list,
+-- which is all the user needs to match against the other client.
+local function verificationText(device, emoji)
+    local lines = {
+        T(_("Other device: %1"), device),
+        "",
+        _("Both devices must show the same words, in the same order:"),
+        "",
+    }
+    for i = 1, #emoji do
+        local pair = emoji[i]
+        local glyph, name
+        if type(pair) == "table" then
+            glyph, name = pair[1], pair[2]
+        end
+        lines[#lines + 1] = T(_("%1. %2  %3"), i, tostring(name or "?"), tostring(glyph or ""))
+    end
+    return table.concat(lines, "\n")
+end
+
+function KMatrix:closeVerification()
+    if self.verify_dialog then
+        UIManager:close(self.verify_dialog)
+        self.verify_dialog = nil
+    end
+end
+
+--- Shows the emoji the daemon computed. Any prompt still on screen is replaced:
+-- only the newest transaction can still be answered.
+function KMatrix:showVerificationEmoji(event)
+    local emoji = event.emoji or {}
+    if not event.transaction or #emoji == 0 then
+        logger.warn("kmatrix: verification prompt without emoji, ignoring")
+        return
+    end
+    self:closeVerification()
+    self:clearBusy()
+    local transaction = event.transaction
+    self.verify_dialog = ButtonDialog:new{
+        title = verificationText(tostring(event.device or "?"), emoji),
+        title_align = "left",
+        -- Bold and a size up: this is the one screen the user has to read
+        -- carefully, and it is read on a grey panel with no backlight to spare.
+        use_info_style = false,
+        title_face = Font:getFace("smalltfont", 26),
+        -- A stray tap must not silently abandon a half-finished verification.
+        dismissable = false,
+        buttons = {
+            {
+                {
+                    text = _("They don't match"),
+                    callback = function()
+                        self:closeVerification()
+                        self:confirmVerification(transaction, false)
+                    end,
+                },
+                {
+                    text = _("They match"),
+                    callback = function()
+                        self:closeVerification()
+                        self:confirmVerification(transaction, true)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(self.verify_dialog)
+end
+
+--- A confirmed match is only really finished once the daemon has exchanged the
+-- MACs, so success is announced by the `done` event, not from here.
+function KMatrix:confirmVerification(transaction, confirm)
+    if not self:daemonReady() then return end
+    self.ipc:request("verify_confirm", { transaction = transaction, confirm = confirm },
+        function(resp)
+            if not resp.ok then
+                self:notify(resp.error and tostring(resp.error)
+                    or _("Could not answer the verification request."), 5)
+            elseif not confirm then
+                self:notify(_("Verification refused."))
+            end
+        end)
+end
+
+--- We only ever answer a verification, we never open one.
+function KMatrix:showVerificationHelp()
+    UIManager:show(InfoMessage:new{
+        text = _("Start the verification on your other client: Settings > Devices > this device > Verify. The emoji to compare then appear here."),
+    })
+end
+
+function KMatrix:onVerificationEvent(event)
+    local phase = event.phase
+    if phase == "emoji" then
+        self:showVerificationEmoji(event)
+    elseif phase == "done" then
+        self:closeVerification()
+        self:notify(T(_("Device %1 is verified. The key backup can now be fetched without typing the recovery key."),
+            tostring(event.device or "?")), 5)
+    elseif phase == "cancelled" then
+        self:closeVerification()
+        self:notify(T(_("Verification stopped: %1"),
+            tostring(event.reason or _("no reason given"))), 5)
+    elseif phase == "secret" then
+        if event.name == "m.megolm_backup.v1" then
+            self.backup = true
+            self:notify(_("Key backup key received from your other device. Older messages will decrypt as you open rooms."), 5)
+        else
+            self:notify(T(_("Received the secret %1 from your other device."),
+                tostring(event.name or "?")))
+        end
+        self:refreshVisibleView()
+    else
+        logger.dbg("kmatrix: ignoring unknown verification phase", tostring(phase))
+    end
+end
+
 function KMatrix:shutdownDaemon()
     if not self:daemonReady() then return end
     -- The daemon closes the socket as it exits, and that close drives our own
@@ -582,6 +707,14 @@ function KMatrix:showAccountDialog()
             callback = function()
                 UIManager:close(dialog)
                 self:showKeyBackupDialog()
+            end,
+        }},
+        {{
+            text = "\u{f00c} " .. _("Verify this device"), -- 'check' sign
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:showVerificationHelp()
             end,
         }},
         {{
@@ -808,6 +941,8 @@ function KMatrix:onDaemonEvent(event)
         if self.timeline and event.room == self.timeline.room then
             self:appendMessages(event.messages or {})
         end
+    elseif event.event == "verification" then
+        self:onVerificationEvent(event)
     else
         logger.dbg("kmatrix: ignoring unknown daemon event", tostring(event.event))
     end

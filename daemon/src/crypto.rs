@@ -15,6 +15,7 @@
 //! `meta` under `backup_key`, base64-encoded, next to the pickle key.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -26,6 +27,7 @@ use vodozemac::{
     },
     olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig as OlmConfig, SessionPickle},
     pk_encryption::{Message as PkMessage, PkDecryption},
+    sas::{EstablishedSas, Mac, Sas},
     Curve25519PublicKey, Curve25519SecretKey,
 };
 
@@ -55,6 +57,25 @@ const RECOVERY_KEY_PREFIX: [u8; 2] = [0x8b, 0x01];
 /// Prefix (2) + Curve25519 private key (32) + parity byte (1).
 const RECOVERY_KEY_LEN: usize = 35;
 
+/// The only verification method we implement, and the only one Element needs
+/// for self-verification.
+const SAS_METHOD: &str = "m.sas.v1";
+
+/// The algorithms we insist on. `hkdf-hmac-sha256.v2` is deliberate: version 1
+/// inherited libolm's base64 bug, where the MAC was encoded out of a buffer
+/// that the encoder had already overwritten.
+const KEY_AGREEMENT_PROTOCOL: &str = "curve25519-hkdf-sha256";
+const SAS_HASH: &str = "sha256";
+const MAC_METHOD: &str = "hkdf-hmac-sha256.v2";
+const SAS_EMOJI_STRING: &str = "emoji";
+
+/// A verification the user never answers must not sit in memory forever, and
+/// the other side will have given up long before this too.
+const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The secret we ask our other devices for once SAS has made them trust us.
+pub const MEGOLM_BACKUP_SECRET: &str = "m.megolm_backup.v1";
+
 /// One remote device, as far as we need to know it to send it a room key.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -62,6 +83,82 @@ pub struct DeviceInfo {
     pub device_id: String,
     pub curve_key: String,
     pub ed_key: String,
+}
+
+/// What the daemon must do next after feeding an event into the verification
+/// state machine. Everything is optional: most events only produce a reply.
+#[derive(Default)]
+pub struct VerifyStep {
+    /// Plaintext to-device events to send: (event type, target device id,
+    /// content). The target is always a device of the user who sent us the
+    /// event that produced this step.
+    pub send: Vec<(String, String, Value)>,
+    /// Show these emoji and wait for [`Crypto::confirm_verification`].
+    /// (transaction id, their device id, seven six-bit emoji indices)
+    pub emoji: Option<(String, String, [u8; 7])>,
+    /// Verification completed with this device id.
+    pub done: Option<String>,
+    /// Verification ended early; human-readable reason.
+    pub cancelled: Option<String>,
+}
+
+/// Something an Olm-encrypted to-device event asked us to act on beyond the
+/// Megolm key transport, which [`Crypto`] handles internally.
+pub enum ToDeviceOutcome {
+    /// A secret we asked for arrived, already Olm-decrypted.
+    Secret {
+        name: String,
+        secret: String,
+        request_id: String,
+    },
+}
+
+/// One in-flight SAS verification, keyed by its transaction id.
+///
+/// We are always the responder: the other side sends `start`, we `accept`, and
+/// the commitment we put in that accept binds our ephemeral key to their exact
+/// start content, so `start` is kept verbatim rather than re-serialised.
+struct Verification {
+    their_user: String,
+    their_device: String,
+    created: Instant,
+    /// Our ephemeral key. The Diffie-Hellman consumes it by value, so it is
+    /// `None` before the start arrives and again once the exchange is done.
+    sas: Option<Sas>,
+    /// Our ephemeral public key, base64. Outlives `sas`.
+    our_public_key: Option<String>,
+    /// Their `m.key.verification.start` content, verbatim.
+    start: Option<Value>,
+    their_public_key: Option<String>,
+    established: Option<EstablishedSas>,
+    we_sent_mac: bool,
+    they_sent_mac: bool,
+    we_sent_done: bool,
+    they_sent_done: bool,
+}
+
+impl Verification {
+    fn new(their_user: &str, their_device: &str) -> Verification {
+        Verification {
+            their_user: their_user.to_string(),
+            their_device: their_device.to_string(),
+            created: Instant::now(),
+            sas: None,
+            our_public_key: None,
+            start: None,
+            their_public_key: None,
+            established: None,
+            we_sent_mac: false,
+            they_sent_mac: false,
+            we_sent_done: false,
+            they_sent_done: false,
+        }
+    }
+
+    /// Both sides have MAC'd their keys and both have said `done`.
+    fn complete(&self) -> bool {
+        self.we_sent_mac && self.they_sent_mac && self.we_sent_done && self.they_sent_done
+    }
 }
 
 pub struct Crypto {
@@ -81,6 +178,14 @@ pub struct Crypto {
     /// their recovery key. `Some` means we can pull single sessions out of the
     /// backup on demand.
     backup_key: Option<PkDecryption>,
+    /// (user id, device id) -> their ed25519 key. Populated from
+    /// `/keys/query` via [`Crypto::remember_devices`]; SAS MACs are taken over
+    /// these keys, so without an entry a peer's MAC cannot be checked.
+    device_ed_keys: HashMap<(String, String), String>,
+    /// transaction id -> in-flight SAS verification.
+    verifications: HashMap<String, Verification>,
+    /// request id -> secret name, for the `m.secret.request`s we sent out.
+    secret_requests: HashMap<String, String>,
 }
 
 impl Crypto {
@@ -162,6 +267,9 @@ impl Crypto {
             olm_sessions,
             known_devices,
             backup_key,
+            device_ed_keys: HashMap::new(),
+            verifications: HashMap::new(),
+            secret_requests: HashMap::new(),
         })
     }
 
@@ -251,25 +359,39 @@ impl Crypto {
 
     /// Process incoming to-device events. A single malformed or undecryptable
     /// event must never cost us the rest of the batch.
-    pub fn handle_to_device(&mut self, store: &Store, events: &[ToDeviceEvent]) -> Result<()> {
+    ///
+    /// Megolm keys are absorbed here; anything the daemon has to act on — a
+    /// shared secret, so far — comes back in the returned list.
+    pub fn handle_to_device(
+        &mut self,
+        store: &Store,
+        events: &[ToDeviceEvent],
+    ) -> Result<Vec<ToDeviceOutcome>> {
+        let mut outcomes = Vec::new();
         for event in events {
             if event.kind != "m.room.encrypted" {
                 continue;
             }
-            if let Err(e) = self.handle_olm_event(store, event) {
-                eprintln!(
+            match self.handle_olm_event(store, event) {
+                Ok(Some(outcome)) => outcomes.push(outcome),
+                Ok(None) => {}
+                Err(e) => eprintln!(
                     "kmatrixd: to-device event from {} dropped: {e:#}",
                     event.sender
-                );
+                ),
             }
         }
-        Ok(())
+        Ok(outcomes)
     }
 
-    fn handle_olm_event(&mut self, store: &Store, event: &ToDeviceEvent) -> Result<()> {
+    fn handle_olm_event(
+        &mut self,
+        store: &Store,
+        event: &ToDeviceEvent,
+    ) -> Result<Option<ToDeviceOutcome>> {
         let content = &event.content;
         if content.get("algorithm").and_then(Value::as_str) != Some(OLM_ALGORITHM) {
-            return Ok(());
+            return Ok(None);
         }
         let sender_key = content
             .get("sender_key")
@@ -334,18 +456,20 @@ impl Crypto {
         store: &Store,
         sender_key: &str,
         plaintext: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<ToDeviceOutcome>> {
         let event: Value = serde_json::from_slice(plaintext).context("parse olm plaintext")?;
-        if event.get("type").and_then(Value::as_str) != Some("m.room_key") {
+        match event.get("type").and_then(Value::as_str) {
+            Some("m.room_key") => {}
+            Some("m.secret.send") => return self.handle_secret_send(sender_key, &event),
             // m.dummy, m.forwarded_room_key, verification traffic: nothing we
             // act on, and nothing worth an error.
-            return Ok(());
+            _ => return Ok(None),
         }
         let content = event
             .get("content")
             .ok_or_else(|| anyhow!("m.room_key without content"))?;
         if content.get("algorithm").and_then(Value::as_str) != Some(MEGOLM_ALGORITHM) {
-            return Ok(());
+            return Ok(None);
         }
 
         // Anti-spoofing: the Olm channel proves which device sent this, so the
@@ -389,7 +513,52 @@ impl Crypto {
             &session.pickle().encrypt(&self.pickle_key),
         )?;
         self.inbound.insert(session_id, session);
-        Ok(())
+        Ok(None)
+    }
+
+    /// A secret one of our other devices shared with us. The Olm channel
+    /// proves which device sent it; the request id proves it answers something
+    /// we asked for, since we picked it at random and only ever sent it to our
+    /// own devices.
+    fn handle_secret_send(
+        &self,
+        sender_key: &str,
+        event: &Value,
+    ) -> Result<Option<ToDeviceOutcome>> {
+        let content = event
+            .get("content")
+            .ok_or_else(|| anyhow!("m.secret.send without content"))?;
+        let request_id = content
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("m.secret.send without request_id"))?;
+        let secret = content
+            .get("secret")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("m.secret.send without secret"))?;
+
+        let Some(name) = self.secret_requests.get(request_id) else {
+            eprintln!(
+                "kmatrixd: ignoring m.secret.send for request {request_id}, which is not ours"
+            );
+            return Ok(None);
+        };
+
+        if let Some((user_id, device_id)) = self.known_devices.get(sender_key) {
+            let claimed = event.get("sender").and_then(Value::as_str);
+            if claimed != Some(user_id.as_str()) {
+                return Err(anyhow!(
+                    "m.secret.send over the olm channel with {user_id}/{device_id} claims sender {}",
+                    claimed.unwrap_or("<missing>")
+                ));
+            }
+        }
+
+        Ok(Some(ToDeviceOutcome::Secret {
+            name: name.clone(),
+            secret: secret.to_string(),
+            request_id: request_id.to_string(),
+        }))
     }
 
     pub fn parse_device_keys(&self, keys_query: &Value) -> Vec<DeviceInfo> {
@@ -423,6 +592,22 @@ impl Crypto {
             }
         }
         out
+    }
+
+    /// Record what `/keys/query` told us about a set of devices. SAS MACs are
+    /// taken over the peer's ed25519 key, so the key has to be on hand before
+    /// the `m.key.verification.mac` arrives.
+    pub fn remember_devices(&mut self, devices: &[DeviceInfo]) {
+        for device in devices {
+            self.device_ed_keys.insert(
+                (device.user_id.clone(), device.device_id.clone()),
+                device.ed_key.clone(),
+            );
+            self.known_devices.insert(
+                device.curve_key.clone(),
+                (device.user_id.clone(), device.device_id.clone()),
+            );
+        }
     }
 
     /// Devices we cannot yet talk to over Olm. Our own device is never in the
@@ -670,6 +855,46 @@ impl Crypto {
         Ok(())
     }
 
+    /// Adopt a backup key handed to us over encrypted secret sharing.
+    ///
+    /// The secret an `m.secret.send` carries is standard base64 of the raw 32
+    /// byte Curve25519 private key — not the base58 recovery key the user
+    /// would otherwise have typed. Both entry points converge on the same
+    /// `meta` row, so a restart cannot tell them apart.
+    pub fn set_backup_key_base64(
+        &mut self,
+        store: &Store,
+        secret_b64: &str,
+        expected_public_key: Option<&str>,
+    ) -> Result<()> {
+        // Tolerate a missing or present pad: implementations disagree, and
+        // four bytes of base64 trivia must not cost the user their history.
+        let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(secret_b64.trim().trim_end_matches('='))
+            .context("decode shared backup key")?;
+        let bytes: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("shared backup key is {} bytes, expected 32", raw.len()))?;
+
+        let decryption = PkDecryption::from_key(Curve25519SecretKey::from_slice(&bytes));
+        let derived = decryption.public_key().to_base64();
+        if let Some(expected) = expected_public_key {
+            if derived != expected.trim().trim_end_matches('=') {
+                return Err(anyhow!(
+                    "the shared backup key does not match this backup: it unlocks {derived}, \
+                     but the backup was made for {expected}"
+                ));
+            }
+        }
+        store.set_meta(
+            BACKUP_KEY_META,
+            &base64::engine::general_purpose::STANDARD.encode(bytes),
+        )?;
+        self.backup_key = Some(decryption);
+        Ok(())
+    }
+
     pub fn has_backup_key(&self) -> bool {
         self.backup_key.is_some()
     }
@@ -762,6 +987,606 @@ impl Crypto {
         )?;
         self.inbound.insert(imported_id, session);
         Ok(true)
+    }
+
+    // ------------------------------------------------- SAS device verification
+
+    /// Feed one plaintext `m.key.verification.*` to-device event into the
+    /// state machine.
+    ///
+    /// We are always the responder. Element sends the request, we answer
+    /// `ready`, it sends `start`, and from there we drive accept -> key ->
+    /// emoji -> (user) -> mac -> done.
+    ///
+    /// Events for a transaction we do not know are ignored in silence rather
+    /// than cancelled: Element sends the same request to every one of our
+    /// devices and cancels the ones that lose the race, so a stranger
+    /// transaction id is the normal case, not an attack.
+    pub fn handle_verification(
+        &mut self,
+        our_user: &str,
+        our_device: &str,
+        sender: &str,
+        kind: &str,
+        content: &Value,
+    ) -> Result<VerifyStep> {
+        self.expire_verifications();
+
+        let Some(transaction) = content.get("transaction_id").and_then(Value::as_str) else {
+            // In-room verification uses m.relates_to instead; we only speak
+            // to-device.
+            return Ok(VerifyStep::default());
+        };
+        let transaction = transaction.to_string();
+
+        match kind {
+            "m.key.verification.request" => {
+                Ok(self.verification_request(&transaction, sender, our_device, content))
+            }
+            "m.key.verification.start" => {
+                Ok(self.verification_start(&transaction, sender, content))
+            }
+            "m.key.verification.key" => {
+                Ok(self.verification_key(&transaction, our_user, our_device, content))
+            }
+            "m.key.verification.mac" => {
+                Ok(self.verification_mac(&transaction, our_user, our_device, content))
+            }
+            "m.key.verification.done" => Ok(self.verification_done(&transaction)),
+            "m.key.verification.cancel" => Ok(self.verification_cancel(&transaction, content)),
+            // m.key.verification.ready and m.key.verification.accept are what
+            // an initiator receives; we never are one.
+            _ => Ok(VerifyStep::default()),
+        }
+    }
+
+    /// The user has looked at the emoji. `confirm` false means they did not
+    /// match, which is the one outcome that must abort loudly.
+    pub fn confirm_verification(
+        &mut self,
+        our_user: &str,
+        our_device: &str,
+        transaction: &str,
+        confirm: bool,
+    ) -> Result<VerifyStep> {
+        let Some(entry) = self.verifications.get(transaction) else {
+            // Expired, or already cancelled by the other side. Tell the UI so
+            // it can take the emoji off the screen.
+            return Ok(VerifyStep {
+                cancelled: Some(format!(
+                    "verification {transaction} is no longer in progress"
+                )),
+                ..VerifyStep::default()
+            });
+        };
+
+        if !confirm {
+            let device = entry.their_device.clone();
+            return Ok(self.cancel(
+                transaction,
+                &device,
+                "m.mismatched_sas",
+                "the emoji did not match",
+            ));
+        }
+
+        let Some(established) = entry.established.as_ref() else {
+            let device = entry.their_device.clone();
+            return Ok(self.cancel(
+                transaction,
+                &device,
+                "m.unexpected_message",
+                "confirmed before the key exchange finished",
+            ));
+        };
+
+        // We only ever MAC our own device key. The master key belongs in a
+        // cross-user MAC, and we have no cross-signing identity of our own.
+        let info = mac_info(
+            our_user,
+            our_device,
+            &entry.their_user,
+            &entry.their_device,
+            transaction,
+        );
+        let key_id = format!("ed25519:{our_device}");
+        let our_ed = self.account.ed25519_key().to_base64();
+        let key_mac = established
+            .calculate_mac(&our_ed, &format!("{info}{key_id}"))
+            .to_base64();
+        let keys_mac = established
+            .calculate_mac(&key_id, &format!("{info}KEY_IDS"))
+            .to_base64();
+
+        let their_device = entry.their_device.clone();
+        let mut mac = Map::new();
+        mac.insert(key_id, Value::String(key_mac));
+        let mut mac_content = Map::new();
+        mac_content.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+        mac_content.insert("keys".to_string(), Value::String(keys_mac));
+        mac_content.insert("mac".to_string(), Value::Object(mac));
+
+        let mut done_content = Map::new();
+        done_content.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+
+        let mut step = VerifyStep {
+            send: vec![
+                (
+                    "m.key.verification.mac".to_string(),
+                    their_device.clone(),
+                    Value::Object(mac_content),
+                ),
+                (
+                    "m.key.verification.done".to_string(),
+                    their_device.clone(),
+                    Value::Object(done_content),
+                ),
+            ],
+            ..VerifyStep::default()
+        };
+
+        if let Some(mut entry) = self.verifications.remove(transaction) {
+            entry.we_sent_mac = true;
+            entry.we_sent_done = true;
+            if entry.complete() {
+                step.done = Some(their_device);
+            } else {
+                self.verifications.insert(transaction.to_string(), entry);
+            }
+        }
+        Ok(step)
+    }
+
+    // --------------------------------------------------------------- secrets
+
+    /// Build an `m.secret.request` for `name`. The caller fans the content out
+    /// to every device of our own user; the request id comes back so it can
+    /// later be cancelled.
+    pub fn secret_request(&mut self, our_device: &str, name: &str) -> (String, Value) {
+        // 128 bits of request id: an attacker who cannot guess it cannot push
+        // us a secret we never asked for.
+        let high: u64 = rand::random();
+        let low: u64 = rand::random();
+        let request_id = format!("{high:016x}{low:016x}");
+        self.secret_requests
+            .insert(request_id.clone(), name.to_string());
+
+        let mut content = Map::new();
+        content.insert("action".to_string(), Value::String("request".to_string()));
+        content.insert("name".to_string(), Value::String(name.to_string()));
+        content.insert("request_id".to_string(), Value::String(request_id.clone()));
+        content.insert(
+            "requesting_device_id".to_string(),
+            Value::String(our_device.to_string()),
+        );
+        (request_id, Value::Object(content))
+    }
+
+    /// Withdraw a request once one device has answered it. The request id
+    /// stays known so that a second, in-flight answer is still accepted rather
+    /// than logged as a forgery.
+    pub fn secret_cancellation(&self, our_device: &str, request_id: &str) -> Value {
+        let mut content = Map::new();
+        content.insert(
+            "action".to_string(),
+            Value::String("request_cancellation".to_string()),
+        );
+        content.insert(
+            "request_id".to_string(),
+            Value::String(request_id.to_string()),
+        );
+        content.insert(
+            "requesting_device_id".to_string(),
+            Value::String(our_device.to_string()),
+        );
+        Value::Object(content)
+    }
+
+    // ---------------------------------------------------- verification steps
+
+    fn verification_request(
+        &mut self,
+        transaction: &str,
+        sender: &str,
+        our_device: &str,
+        content: &Value,
+    ) -> VerifyStep {
+        let Some(from_device) = content.get("from_device").and_then(Value::as_str) else {
+            return VerifyStep::default();
+        };
+        let supported = content
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|m| m.iter().any(|v| v.as_str() == Some(SAS_METHOD)));
+        if !supported {
+            return self.cancel(
+                transaction,
+                from_device,
+                "m.unknown_method",
+                "this device only speaks m.sas.v1",
+            );
+        }
+
+        self.verifications.insert(
+            transaction.to_string(),
+            Verification::new(sender, from_device),
+        );
+
+        let mut ready = Map::new();
+        ready.insert(
+            "from_device".to_string(),
+            Value::String(our_device.to_string()),
+        );
+        ready.insert(
+            "methods".to_string(),
+            Value::Array(vec![Value::String(SAS_METHOD.to_string())]),
+        );
+        ready.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+        VerifyStep {
+            send: vec![(
+                "m.key.verification.ready".to_string(),
+                from_device.to_string(),
+                Value::Object(ready),
+            )],
+            ..VerifyStep::default()
+        }
+    }
+
+    fn verification_start(
+        &mut self,
+        transaction: &str,
+        sender: &str,
+        content: &Value,
+    ) -> VerifyStep {
+        if !self.verifications.contains_key(transaction) {
+            // A verification may begin with a bare `start`; the request and
+            // ready round trip is optional. Answering one costs nothing until
+            // the user confirms the emoji, so adopt it rather than go silent.
+            let Some(from_device) = content.get("from_device").and_then(Value::as_str) else {
+                return VerifyStep::default();
+            };
+            self.verifications.insert(
+                transaction.to_string(),
+                Verification::new(sender, from_device),
+            );
+        }
+        let Some(entry) = self.verifications.get(transaction) else {
+            return VerifyStep::default();
+        };
+        if entry.start.is_some() {
+            // A duplicate start would move our ephemeral key out from under a
+            // commitment the other side has already seen.
+            return VerifyStep::default();
+        }
+        let their_device = entry.their_device.clone();
+
+        if content.get("method").and_then(Value::as_str) != Some(SAS_METHOD) {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.unknown_method",
+                "this device only speaks m.sas.v1",
+            );
+        }
+
+        let offers = |field: &str, wanted: &str| -> bool {
+            content
+                .get(field)
+                .and_then(Value::as_array)
+                .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(wanted)))
+        };
+        let negotiated = offers("key_agreement_protocols", KEY_AGREEMENT_PROTOCOL)
+            && offers("hashes", SAS_HASH)
+            && offers("message_authentication_codes", MAC_METHOD)
+            && offers("short_authentication_string", SAS_EMOJI_STRING);
+        if !negotiated {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.unknown_method",
+                "no shared key agreement, hash, MAC or SAS method",
+            );
+        }
+
+        // The hash commitment: we are the accepting side, so we commit to the
+        // ephemeral key we will only reveal after they have revealed theirs.
+        let sas = Sas::new();
+        let our_public_key = sas.public_key().to_base64();
+        let mut committed = our_public_key.clone().into_bytes();
+        committed.extend_from_slice(canonical_json_verbatim(content).as_bytes());
+        let commitment = vodozemac::base64_encode(sha256(&committed));
+
+        let mut accept = Map::new();
+        accept.insert("commitment".to_string(), Value::String(commitment));
+        accept.insert("hash".to_string(), Value::String(SAS_HASH.to_string()));
+        accept.insert(
+            "key_agreement_protocol".to_string(),
+            Value::String(KEY_AGREEMENT_PROTOCOL.to_string()),
+        );
+        accept.insert(
+            "message_authentication_code".to_string(),
+            Value::String(MAC_METHOD.to_string()),
+        );
+        accept.insert("method".to_string(), Value::String(SAS_METHOD.to_string()));
+        accept.insert(
+            "short_authentication_string".to_string(),
+            Value::Array(vec![Value::String(SAS_EMOJI_STRING.to_string())]),
+        );
+        accept.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+
+        if let Some(entry) = self.verifications.get_mut(transaction) {
+            entry.sas = Some(sas);
+            entry.our_public_key = Some(our_public_key);
+            entry.start = Some(content.clone());
+        }
+
+        VerifyStep {
+            send: vec![(
+                "m.key.verification.accept".to_string(),
+                their_device,
+                Value::Object(accept),
+            )],
+            ..VerifyStep::default()
+        }
+    }
+
+    fn verification_key(
+        &mut self,
+        transaction: &str,
+        our_user: &str,
+        our_device: &str,
+        content: &Value,
+    ) -> VerifyStep {
+        // Taken out of the map for the duration: the Diffie-Hellman consumes
+        // our ephemeral key by value, and every failure path below ends the
+        // transaction anyway.
+        let Some(mut entry) = self.verifications.remove(transaction) else {
+            return VerifyStep::default();
+        };
+        let their_device = entry.their_device.clone();
+        let their_user = entry.their_user.clone();
+
+        let Some(their_key) = content.get("key").and_then(Value::as_str) else {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.invalid_message",
+                "m.key.verification.key without a key",
+            );
+        };
+        let their_key = their_key.to_string();
+
+        let (Some(sas), Some(our_key)) = (entry.sas.take(), entry.our_public_key.clone()) else {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.unexpected_message",
+                "a key arrived before the start was accepted",
+            );
+        };
+
+        let established = match sas.diffie_hellman_with_raw(&their_key) {
+            Ok(established) => established,
+            Err(e) => {
+                return self.cancel(
+                    transaction,
+                    &their_device,
+                    "m.invalid_message",
+                    &format!("their SAS key is unusable: {e}"),
+                )
+            }
+        };
+
+        // They started, so their side of the info string comes first.
+        let info = format!(
+            "MATRIX_KEY_VERIFICATION_SAS|{their_user}|{their_device}|{their_key}\
+             |{our_user}|{our_device}|{our_key}|{transaction}"
+        );
+        let indices = established.bytes(&info).emoji_indices();
+
+        entry.their_public_key = Some(their_key);
+        entry.established = Some(established);
+        self.verifications.insert(transaction.to_string(), entry);
+
+        let mut key = Map::new();
+        key.insert("key".to_string(), Value::String(our_key));
+        key.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+
+        VerifyStep {
+            send: vec![(
+                "m.key.verification.key".to_string(),
+                their_device.clone(),
+                Value::Object(key),
+            )],
+            emoji: Some((transaction.to_string(), their_device, indices)),
+            ..VerifyStep::default()
+        }
+    }
+
+    fn verification_mac(
+        &mut self,
+        transaction: &str,
+        our_user: &str,
+        our_device: &str,
+        content: &Value,
+    ) -> VerifyStep {
+        let Some(mut entry) = self.verifications.remove(transaction) else {
+            return VerifyStep::default();
+        };
+        let their_device = entry.their_device.clone();
+        let their_user = entry.their_user.clone();
+
+        let Some(established) = entry.established.take() else {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.unexpected_message",
+                "a MAC arrived before the key exchange",
+            );
+        };
+        let (Some(macs), Some(keys_mac)) = (
+            content.get("mac").and_then(Value::as_object),
+            content.get("keys").and_then(Value::as_str),
+        ) else {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.invalid_message",
+                "m.key.verification.mac without mac and keys",
+            );
+        };
+
+        // The MAC info string names the sender first, and they are the sender
+        // of the MACs we are checking.
+        let info = mac_info(
+            &their_user,
+            &their_device,
+            our_user,
+            our_device,
+            transaction,
+        );
+
+        let mut key_ids: Vec<&str> = macs.keys().map(String::as_str).collect();
+        key_ids.sort_unstable();
+        let joined = key_ids.join(",");
+        if verify_mac_b64(&established, &joined, &format!("{info}KEY_IDS"), keys_mac).is_err() {
+            return self.cancel(
+                transaction,
+                &their_device,
+                "m.key_mismatch",
+                "the MAC over their key ids did not verify",
+            );
+        }
+
+        for key_id in key_ids {
+            let Some(mac) = macs.get(key_id).and_then(Value::as_str) else {
+                return self.cancel(
+                    transaction,
+                    &their_device,
+                    "m.invalid_message",
+                    "a MAC entry was not a string",
+                );
+            };
+            let Some(device_id) = key_id.strip_prefix("ed25519:") else {
+                // Some other key algorithm. It was covered by the KEY_IDS MAC,
+                // so it is not forged, only uninteresting.
+                continue;
+            };
+            let Some(their_ed) = self
+                .device_ed_keys
+                .get(&(their_user.clone(), device_id.to_string()))
+            else {
+                eprintln!(
+                    "kmatrixd: verification {transaction}: no ed25519 key known for \
+                     {their_user}/{device_id}, skipping its MAC"
+                );
+                continue;
+            };
+            if verify_mac_b64(&established, their_ed, &format!("{info}{key_id}"), mac).is_err() {
+                return self.cancel(
+                    transaction,
+                    &their_device,
+                    "m.key_mismatch",
+                    &format!("the MAC over {key_id} did not verify"),
+                );
+            }
+        }
+
+        entry.established = Some(established);
+        entry.they_sent_mac = true;
+
+        let mut step = VerifyStep::default();
+        if entry.complete() {
+            step.done = Some(their_device);
+        } else {
+            self.verifications.insert(transaction.to_string(), entry);
+        }
+        step
+    }
+
+    fn verification_done(&mut self, transaction: &str) -> VerifyStep {
+        let mut step = VerifyStep::default();
+        if let Some(mut entry) = self.verifications.remove(transaction) {
+            entry.they_sent_done = true;
+            if entry.complete() {
+                step.done = Some(entry.their_device.clone());
+            } else {
+                self.verifications.insert(transaction.to_string(), entry);
+            }
+        }
+        step
+    }
+
+    fn verification_cancel(&mut self, transaction: &str, content: &Value) -> VerifyStep {
+        let Some(entry) = self.verifications.remove(transaction) else {
+            return VerifyStep::default();
+        };
+        let reason = content
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| content.get("code").and_then(Value::as_str))
+            .unwrap_or("the other device cancelled the verification");
+        eprintln!(
+            "kmatrixd: verification {transaction} with {} cancelled: {reason}",
+            entry.their_device
+        );
+        VerifyStep {
+            cancelled: Some(reason.to_string()),
+            ..VerifyStep::default()
+        }
+    }
+
+    /// Drop the transaction and emit the cancel the other side expects.
+    fn cancel(
+        &mut self,
+        transaction: &str,
+        their_device: &str,
+        code: &str,
+        reason: &str,
+    ) -> VerifyStep {
+        self.verifications.remove(transaction);
+        let mut content = Map::new();
+        content.insert("code".to_string(), Value::String(code.to_string()));
+        content.insert("reason".to_string(), Value::String(reason.to_string()));
+        content.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction.to_string()),
+        );
+        VerifyStep {
+            send: vec![(
+                "m.key.verification.cancel".to_string(),
+                their_device.to_string(),
+                Value::Object(content),
+            )],
+            cancelled: Some(reason.to_string()),
+            ..VerifyStep::default()
+        }
+    }
+
+    fn expire_verifications(&mut self) {
+        let now = Instant::now();
+        self.verifications.retain(|transaction, entry| {
+            let alive = now.duration_since(entry.created) < VERIFICATION_TIMEOUT;
+            if !alive {
+                eprintln!("kmatrixd: verification {transaction} expired");
+            }
+            alive
+        });
     }
 
     // ------------------------------------------------------------- internals
@@ -1157,6 +1982,145 @@ fn write_json_string(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+// ---------------------------------------------------------- SAS verification
+
+/// Canonical JSON without the signing algorithm's redaction step.
+///
+/// [`canonical_json`] drops top-level `signatures` and `unsigned` because
+/// everything it is used for is about to be signed. The SAS commitment is not:
+/// it hashes the start event's content exactly as the other side serialised
+/// it, so nothing may be removed.
+fn canonical_json_verbatim(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+/// The info string a SAS MAC is keyed with. The MAC's sender comes first, then
+/// the recipient, then the transaction, all run together without separators;
+/// the caller appends either a key id or the literal `KEY_IDS`.
+fn mac_info(
+    sender_user: &str,
+    sender_device: &str,
+    other_user: &str,
+    other_device: &str,
+    transaction: &str,
+) -> String {
+    format!(
+        "MATRIX_KEY_VERIFICATION_MAC{sender_user}{sender_device}\
+         {other_user}{other_device}{transaction}"
+    )
+}
+
+/// Check one base64 MAC. A MAC we cannot even decode is a failure, not an
+/// error to bubble: either way the verification cannot continue.
+fn verify_mac_b64(
+    established: &EstablishedSas,
+    input: &str,
+    info: &str,
+    mac_b64: &str,
+) -> std::result::Result<(), ()> {
+    let mac = Mac::from_base64(mac_b64).map_err(|_| ())?;
+    established.verify_mac(input, info, &mac).map_err(|_| ())
+}
+
+/// FIPS 180-4 round constants.
+#[rustfmt::skip]
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// SHA-256, as the SAS commitment needs it.
+///
+/// This is hand-rolled on purpose. The daemon's dependency set is pinned, and
+/// none of the eight crates it may name re-exports a hash: vodozemac keeps
+/// `sha2` private (only HKDF/HMAC leak out, through `sas`), and `rusqlite` and
+/// `ureq` pull `sha2`/`ring` in transitively, which Rust gives us no way to
+/// name. Forty lines of FIPS 180-4 with the NIST vectors under test beats
+/// widening the supply chain for one hash of about two hundred bytes.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let mut blocks = data.chunks_exact(64);
+    for block in &mut blocks {
+        sha256_block(&mut h, block);
+    }
+
+    // Padding: 0x80, zeroes, then the length in bits as a big-endian u64,
+    // which needs one final block, or two when the remainder leaves no room.
+    let rest = blocks.remainder();
+    let mut tail = [0u8; 128];
+    tail[..rest.len()].copy_from_slice(rest);
+    tail[rest.len()] = 0x80;
+    let tail_len = if rest.len() < 56 { 64 } else { 128 };
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
+    for block in tail[..tail_len].chunks_exact(64) {
+        sha256_block(&mut h, block);
+    }
+
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(h) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// One 64 byte compression round. `block` is always exactly 64 bytes.
+fn sha256_block(h: &mut [u32; 8], block: &[u8]) {
+    let mut w = [0u32; 64];
+    for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
+        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    for i in 16..64 {
+        let x = w[i - 15];
+        let y = w[i - 2];
+        let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+        let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut i] = *h;
+    for (round, k) in SHA256_K.iter().enumerate() {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = i
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(*k)
+            .wrapping_add(w[round]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+
+        i = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+
+    for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, i]) {
+        *slot = slot.wrapping_add(value);
+    }
 }
 
 #[cfg(test)]
@@ -1831,5 +2795,677 @@ mod tests {
             Ok(p) => assert_eq!(p, "{\"body\":\"third\"}"),
             Err(e) => panic!("decrypt after reload: {e:#}"),
         }
+    }
+
+    // ----------------------------------------------------- SAS verification
+
+    const OUR_USER: &str = "@me:example.org";
+    const OUR_DEVICE: &str = "KINDLE";
+    const THEIR_DEVICE: &str = "ELEMENT";
+
+    /// The other end of a verification, driven by hand out of vodozemac.
+    struct Initiator {
+        account: Account,
+        sas: Option<Sas>,
+        established: Option<EstablishedSas>,
+    }
+
+    impl Initiator {
+        fn new() -> Initiator {
+            Initiator {
+                account: Account::new(),
+                sas: Some(Sas::new()),
+                established: None,
+            }
+        }
+
+        fn device(&self) -> DeviceInfo {
+            DeviceInfo {
+                user_id: OUR_USER.to_string(),
+                device_id: THEIR_DEVICE.to_string(),
+                curve_key: self.account.curve25519_key().to_base64(),
+                ed_key: self.account.ed25519_key().to_base64(),
+            }
+        }
+
+        fn public_key(&self) -> String {
+            match &self.sas {
+                Some(sas) => sas.public_key().to_base64(),
+                None => match &self.established {
+                    Some(e) => e.our_public_key().to_base64(),
+                    None => panic!("initiator has no ephemeral key"),
+                },
+            }
+        }
+
+        fn dh(&mut self, our_key: &str) {
+            let sas = match self.sas.take() {
+                Some(sas) => sas,
+                None => panic!("initiator already did the exchange"),
+            };
+            match sas.diffie_hellman_with_raw(our_key) {
+                Ok(e) => self.established = Some(e),
+                Err(e) => panic!("initiator diffie-hellman: {e}"),
+            }
+        }
+
+        fn established(&self) -> &EstablishedSas {
+            match &self.established {
+                Some(e) => e,
+                None => panic!("initiator has not done the exchange"),
+            }
+        }
+    }
+
+    fn start_content(transaction: &str) -> Value {
+        json!({
+            "from_device": THEIR_DEVICE,
+            "method": SAS_METHOD,
+            "transaction_id": transaction,
+            "key_agreement_protocols": ["curve25519-hkdf-sha256"],
+            "hashes": ["sha256"],
+            "message_authentication_codes": ["hkdf-hmac-sha256", "hkdf-hmac-sha256.v2"],
+            "short_authentication_string": ["decimal", "emoji"],
+        })
+    }
+
+    fn feed(crypto: &mut Crypto, kind: &str, content: &Value) -> VerifyStep {
+        match crypto.handle_verification(OUR_USER, OUR_DEVICE, OUR_USER, kind, content) {
+            Ok(step) => step,
+            Err(e) => panic!("handle_verification({kind}): {e:#}"),
+        }
+    }
+
+    fn only_send<'a>(step: &'a VerifyStep, kind: &str) -> &'a Value {
+        match step.send.as_slice() {
+            [(sent_kind, device, content)] if sent_kind == kind && device == THEIR_DEVICE => {
+                content
+            }
+            other => panic!("expected a single {kind}, got {} events", other.len()),
+        }
+    }
+
+    /// Walk request -> ready -> start -> accept -> key -> key, and hand back
+    /// the accept content plus the emoji we would show.
+    fn run_to_emoji(
+        crypto: &mut Crypto,
+        initiator: &mut Initiator,
+        transaction: &str,
+    ) -> (Value, [u8; 7]) {
+        let request = json!({
+            "from_device": THEIR_DEVICE,
+            "methods": [SAS_METHOD],
+            "transaction_id": transaction,
+            "timestamp": 1_700_000_000_000u64,
+        });
+        let ready = feed(crypto, "m.key.verification.request", &request);
+        let content = only_send(&ready, "m.key.verification.ready");
+        assert_eq!(content["from_device"], OUR_DEVICE);
+        assert_eq!(content["methods"], json!([SAS_METHOD]));
+
+        let start = start_content(transaction);
+        let accepted = feed(crypto, "m.key.verification.start", &start);
+        let accept = only_send(&accepted, "m.key.verification.accept").clone();
+        assert_eq!(accept["key_agreement_protocol"], KEY_AGREEMENT_PROTOCOL);
+        assert_eq!(accept["hash"], SAS_HASH);
+        assert_eq!(accept["message_authentication_code"], MAC_METHOD);
+        assert_eq!(accept["short_authentication_string"], json!(["emoji"]));
+
+        let their_key = initiator.public_key();
+        let keyed = feed(
+            crypto,
+            "m.key.verification.key",
+            &json!({"transaction_id": transaction, "key": their_key}),
+        );
+        let our_key = match only_send(&keyed, "m.key.verification.key")["key"].as_str() {
+            Some(k) => k.to_string(),
+            None => panic!("our key event carries no key"),
+        };
+        let (txn, device, indices) = match keyed.emoji {
+            Some(e) => e,
+            None => panic!("no emoji after the key exchange"),
+        };
+        assert_eq!(txn, transaction);
+        assert_eq!(device, THEIR_DEVICE);
+
+        // The commitment we published must be the spec's hash of the key we
+        // have only now revealed, over the start content byte for byte.
+        let mut committed = our_key.clone().into_bytes();
+        committed.extend_from_slice(canonical_json_verbatim(&start).as_bytes());
+        assert_eq!(
+            accept["commitment"],
+            Value::String(vodozemac::base64_encode(sha256(&committed)))
+        );
+
+        initiator.dh(&our_key);
+        let info = format!(
+            "MATRIX_KEY_VERIFICATION_SAS|{OUR_USER}|{THEIR_DEVICE}|{their_key}\
+             |{OUR_USER}|{OUR_DEVICE}|{our_key}|{transaction}"
+        );
+        assert_eq!(
+            initiator.established().bytes(&info).emoji_indices(),
+            indices
+        );
+
+        (accept, indices)
+    }
+
+    fn initiator_mac_content(initiator: &Initiator, transaction: &str) -> Value {
+        let info = mac_info(OUR_USER, THEIR_DEVICE, OUR_USER, OUR_DEVICE, transaction);
+        let key_id = format!("ed25519:{THEIR_DEVICE}");
+        let their_ed = initiator.account.ed25519_key().to_base64();
+        json!({
+            "transaction_id": transaction,
+            "keys": initiator
+                .established()
+                .calculate_mac(&key_id, &format!("{info}KEY_IDS"))
+                .to_base64(),
+            "mac": {
+                key_id.clone(): initiator
+                    .established()
+                    .calculate_mac(&their_ed, &format!("{info}{key_id}"))
+                    .to_base64(),
+            },
+        })
+    }
+
+    #[test]
+    fn sas_verification_round_trip() {
+        let temp = TempStore::new("sas");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        let mut initiator = Initiator::new();
+        crypto.remember_devices(&[initiator.device()]);
+
+        let transaction = "kmatrix-sas-1";
+        let (_accept, indices) = run_to_emoji(&mut crypto, &mut initiator, transaction);
+        assert!(indices.iter().all(|i| *i < 64));
+
+        // Their MAC lands before the user has looked at the screen.
+        let their_mac = initiator_mac_content(&initiator, transaction);
+        let step = feed(&mut crypto, "m.key.verification.mac", &their_mac);
+        assert!(step.send.is_empty(), "a valid MAC must not be answered yet");
+        assert!(step.cancelled.is_none());
+        assert!(step.done.is_none());
+
+        // The user says the emoji match.
+        let confirmed = match crypto.confirm_verification(OUR_USER, OUR_DEVICE, transaction, true) {
+            Ok(step) => step,
+            Err(e) => panic!("confirm_verification: {e:#}"),
+        };
+        assert!(confirmed.done.is_none(), "they have not said done yet");
+        let kinds: Vec<&str> = confirmed
+            .send
+            .iter()
+            .map(|(kind, _, _)| kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["m.key.verification.mac", "m.key.verification.done"]
+        );
+
+        // Our MAC must verify on the initiator's side.
+        let our_mac = &confirmed.send[0].2;
+        let info = mac_info(OUR_USER, OUR_DEVICE, OUR_USER, THEIR_DEVICE, transaction);
+        let key_id = format!("ed25519:{OUR_DEVICE}");
+        let our_ed = crypto.ed25519_key();
+        let sent_mac = match our_mac["mac"][&key_id].as_str() {
+            Some(m) => m.to_string(),
+            None => panic!("our MAC event has no entry for {key_id}"),
+        };
+        let sent_keys = match our_mac["keys"].as_str() {
+            Some(m) => m.to_string(),
+            None => panic!("our MAC event has no keys MAC"),
+        };
+        if verify_mac_b64(
+            initiator.established(),
+            &our_ed,
+            &format!("{info}{key_id}"),
+            &sent_mac,
+        )
+        .is_err()
+        {
+            panic!("the initiator could not verify our device key MAC");
+        }
+        if verify_mac_b64(
+            initiator.established(),
+            &key_id,
+            &format!("{info}KEY_IDS"),
+            &sent_keys,
+        )
+        .is_err()
+        {
+            panic!("the initiator could not verify our key id MAC");
+        }
+
+        let finished = feed(
+            &mut crypto,
+            "m.key.verification.done",
+            &json!({"transaction_id": transaction}),
+        );
+        assert_eq!(finished.done.as_deref(), Some(THEIR_DEVICE));
+        assert!(crypto.verifications.is_empty());
+    }
+
+    #[test]
+    fn sas_commitment_binds_our_key_and_the_start_content() {
+        // We are always the responder, so we *publish* the commitment and
+        // never receive one: `m.key.verification.accept` is the only event
+        // that carries the field, and only an initiator is sent an accept.
+        // What can go wrong on our side is a commitment that does not pin
+        // down our ephemeral key or the exact start we answered, which is
+        // what the initiator checks and what is asserted here.
+        let temp = TempStore::new("sas-commit");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        let mut initiator = Initiator::new();
+        crypto.remember_devices(&[initiator.device()]);
+
+        let transaction = "kmatrix-sas-commit";
+        let (accept, _) = run_to_emoji(&mut crypto, &mut initiator, transaction);
+        let commitment = match accept["commitment"].as_str() {
+            Some(c) => c.to_string(),
+            None => panic!("the accept carries no commitment"),
+        };
+
+        // One extra field in the start, and the commitment no longer matches:
+        // an initiator that saw a different start would reject us.
+        let mut tampered = start_content(transaction);
+        tampered["hashes"] = json!(["sha256", "sha3-256"]);
+        let our_key = match crypto.verifications.get(transaction) {
+            Some(entry) => match &entry.our_public_key {
+                Some(k) => k.clone(),
+                None => panic!("no ephemeral key recorded"),
+            },
+            None => panic!("the transaction disappeared"),
+        };
+        let mut committed = our_key.into_bytes();
+        committed.extend_from_slice(canonical_json_verbatim(&tampered).as_bytes());
+        assert_ne!(commitment, vodozemac::base64_encode(sha256(&committed)));
+
+        // A different ephemeral key does not match either.
+        let mut other = Sas::new().public_key().to_base64().into_bytes();
+        other.extend_from_slice(canonical_json_verbatim(&start_content(transaction)).as_bytes());
+        assert_ne!(commitment, vodozemac::base64_encode(sha256(&other)));
+    }
+
+    #[test]
+    fn sas_rejects_an_unusable_start() {
+        let temp = TempStore::new("sas-start");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+
+        let transaction = "kmatrix-sas-bad-start";
+        feed(
+            &mut crypto,
+            "m.key.verification.request",
+            &json!({
+                "from_device": THEIR_DEVICE,
+                "methods": [SAS_METHOD],
+                "transaction_id": transaction,
+            }),
+        );
+
+        // Only the libolm-buggy MAC version on offer: nothing to negotiate.
+        let mut start = start_content(transaction);
+        start["message_authentication_codes"] = json!(["hkdf-hmac-sha256"]);
+        let step = feed(&mut crypto, "m.key.verification.start", &start);
+        let cancel = only_send(&step, "m.key.verification.cancel");
+        assert_eq!(cancel["code"], "m.unknown_method");
+        assert!(step.emoji.is_none());
+        assert!(step.cancelled.is_some());
+        assert!(crypto.verifications.is_empty());
+    }
+
+    #[test]
+    fn sas_rejects_a_forged_mac() {
+        let temp = TempStore::new("sas-mac");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        let mut initiator = Initiator::new();
+        crypto.remember_devices(&[initiator.device()]);
+
+        let transaction = "kmatrix-sas-mac";
+        run_to_emoji(&mut crypto, &mut initiator, transaction);
+
+        // A MAC taken over somebody else's ed25519 key.
+        let info = mac_info(OUR_USER, THEIR_DEVICE, OUR_USER, OUR_DEVICE, transaction);
+        let key_id = format!("ed25519:{THEIR_DEVICE}");
+        let impostor = Account::new().ed25519_key().to_base64();
+        let forged = json!({
+            "transaction_id": transaction,
+            "keys": initiator
+                .established()
+                .calculate_mac(&key_id, &format!("{info}KEY_IDS"))
+                .to_base64(),
+            "mac": {
+                key_id.clone(): initiator
+                    .established()
+                    .calculate_mac(&impostor, &format!("{info}{key_id}"))
+                    .to_base64(),
+            },
+        });
+
+        let step = feed(&mut crypto, "m.key.verification.mac", &forged);
+        let cancel = only_send(&step, "m.key.verification.cancel");
+        assert_eq!(cancel["code"], "m.key_mismatch");
+        assert!(step.done.is_none());
+        assert!(crypto.verifications.is_empty());
+    }
+
+    #[test]
+    fn refusing_the_emoji_cancels_without_a_mac() {
+        let temp = TempStore::new("sas-refuse");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        let mut initiator = Initiator::new();
+        crypto.remember_devices(&[initiator.device()]);
+
+        let transaction = "kmatrix-sas-refuse";
+        run_to_emoji(&mut crypto, &mut initiator, transaction);
+
+        let step = match crypto.confirm_verification(OUR_USER, OUR_DEVICE, transaction, false) {
+            Ok(step) => step,
+            Err(e) => panic!("confirm_verification(false): {e:#}"),
+        };
+        let cancel = only_send(&step, "m.key.verification.cancel");
+        assert_eq!(cancel["code"], "m.mismatched_sas");
+        assert_eq!(cancel["transaction_id"], transaction);
+        assert!(step.done.is_none());
+        assert!(step.cancelled.is_some());
+        assert!(crypto.verifications.is_empty());
+    }
+
+    #[test]
+    fn unknown_transactions_are_ignored() {
+        let temp = TempStore::new("sas-unknown");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+
+        // Element sends its request to every device and cancels the losers, so
+        // a transaction we never took part in must not provoke a reply.
+        let stranger = "someone-elses-transaction";
+        for (kind, content) in [
+            (
+                "m.key.verification.key",
+                json!({"transaction_id": stranger, "key": Sas::new().public_key().to_base64()}),
+            ),
+            (
+                "m.key.verification.mac",
+                json!({"transaction_id": stranger, "keys": "AA", "mac": {}}),
+            ),
+            (
+                "m.key.verification.done",
+                json!({"transaction_id": stranger}),
+            ),
+            (
+                "m.key.verification.cancel",
+                json!({"transaction_id": stranger, "code": "m.accepted"}),
+            ),
+            (
+                "m.key.verification.accept",
+                json!({"transaction_id": stranger, "commitment": "AA"}),
+            ),
+        ] {
+            let step = feed(&mut crypto, kind, &content);
+            assert!(step.send.is_empty(), "{kind} produced a reply");
+            assert!(step.emoji.is_none(), "{kind} produced emoji");
+            assert!(step.done.is_none(), "{kind} completed something");
+            assert!(step.cancelled.is_none(), "{kind} cancelled something");
+        }
+        assert!(crypto.verifications.is_empty());
+
+        // Contents we cannot route anywhere are equally uninteresting: no
+        // transaction id, or a start that names no device to answer.
+        for content in [json!({}), json!({"transaction_id": stranger})] {
+            let step = feed(&mut crypto, "m.key.verification.start", &content);
+            assert!(step.send.is_empty());
+            assert!(crypto.verifications.is_empty());
+        }
+
+        // A `start` that does name its device is a legal opening move even
+        // without the request/ready round trip, so it is adopted.
+        let step = feed(
+            &mut crypto,
+            "m.key.verification.start",
+            &start_content(stranger),
+        );
+        let accept = only_send(&step, "m.key.verification.accept");
+        assert_eq!(accept["transaction_id"], stranger);
+        assert!(crypto.verifications.contains_key(stranger));
+    }
+
+    // ----------------------------------------------------------- secrets
+
+    #[test]
+    fn backup_key_from_a_shared_secret() {
+        let temp = TempStore::new("secret-backup");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+
+        let secret_bytes: [u8; 32] = rand::random();
+        let decryption = PkDecryption::from_key(Curve25519SecretKey::from_slice(&secret_bytes));
+        let public = decryption.public_key().to_base64();
+        let padded = base64::engine::general_purpose::STANDARD.encode(secret_bytes);
+        let unpadded = padded.trim_end_matches('=').to_string();
+
+        assert!(!crypto.has_backup_key());
+        match crypto.set_backup_key_base64(&store, &padded, Some(&public)) {
+            Ok(()) => {}
+            Err(e) => panic!("padded secret rejected: {e:#}"),
+        }
+        assert!(crypto.has_backup_key());
+
+        // Both spellings land on the same `meta` row as the typed recovery
+        // key, so a restart cannot tell the two entry points apart.
+        match crypto.set_backup_key_base64(&store, &unpadded, Some(&public)) {
+            Ok(()) => {}
+            Err(e) => panic!("unpadded secret rejected: {e:#}"),
+        }
+        match store.get_meta(BACKUP_KEY_META) {
+            Ok(Some(stored)) => assert_eq!(stored, padded),
+            Ok(None) => panic!("the backup key was not persisted"),
+            Err(e) => panic!("get_meta: {e:#}"),
+        }
+
+        let other: [u8; 32] = rand::random();
+        let other_public = PkDecryption::from_key(Curve25519SecretKey::from_slice(&other))
+            .public_key()
+            .to_base64();
+        let err = match crypto.set_backup_key_base64(
+            &store,
+            &base64::engine::general_purpose::STANDARD.encode(other),
+            Some(&public),
+        ) {
+            Ok(()) => panic!("a secret for a different backup was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains(&other_public), "unexpected error: {err}");
+
+        let err = match crypto.set_backup_key_base64(&store, "c2hvcnQ=", Some(&public)) {
+            Ok(()) => panic!("a short secret was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("expected 32"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn secret_request_round_trip() {
+        let temp = TempStore::new("secret-share");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+
+        let (request_id, content) = crypto.secret_request(OUR_DEVICE, MEGOLM_BACKUP_SECRET);
+        assert_eq!(content["action"], "request");
+        assert_eq!(content["name"], MEGOLM_BACKUP_SECRET);
+        assert_eq!(content["requesting_device_id"], OUR_DEVICE);
+        assert_eq!(content["request_id"], request_id.as_str());
+
+        let cancellation = crypto.secret_cancellation(OUR_DEVICE, &request_id);
+        assert_eq!(cancellation["action"], "request_cancellation");
+        assert_eq!(cancellation["request_id"], request_id.as_str());
+        assert_eq!(cancellation["requesting_device_id"], OUR_DEVICE);
+
+        // A real Olm channel from our "other device" back to us.
+        let our_curve = crypto.curve25519_key();
+        let otk = match crypto.keys_upload_body(OUR_USER, OUR_DEVICE, 0, false) {
+            Ok(Some(body)) => match body["one_time_keys"].as_object() {
+                Some(keys) => match keys.values().next().and_then(one_time_key_value) {
+                    Some(k) => k.to_string(),
+                    None => panic!("no one-time key in the upload body"),
+                },
+                None => panic!("no one_time_keys in the upload body"),
+            },
+            Ok(None) => panic!("expected an upload body"),
+            Err(e) => panic!("keys_upload_body: {e:#}"),
+        };
+
+        let peer = Account::new();
+        let identity = match Curve25519PublicKey::from_base64(&our_curve) {
+            Ok(k) => k,
+            Err(e) => panic!("our curve key: {e}"),
+        };
+        let one_time_key = match Curve25519PublicKey::from_base64(&otk) {
+            Ok(k) => k,
+            Err(e) => panic!("our one-time key: {e}"),
+        };
+        let mut session =
+            match peer.create_outbound_session(OlmConfig::version_1(), identity, one_time_key) {
+                Ok(s) => s,
+                Err(e) => panic!("create_outbound_session: {e}"),
+            };
+        let peer_curve = peer.curve25519_key().to_base64();
+
+        let secret = "cHJldGVuZC10aGlzLWlzLWEtYmFja3VwLWtleQ";
+        let deliver = |session: &mut Session, plaintext: &Value| -> ToDeviceEvent {
+            let raw = match serde_json::to_vec(plaintext) {
+                Ok(v) => v,
+                Err(e) => panic!("serialize: {e}"),
+            };
+            let message = match session.encrypt(&raw) {
+                Ok(m) => m,
+                Err(e) => panic!("olm encrypt: {e}"),
+            };
+            let (message_type, body) = message.to_parts();
+            ToDeviceEvent {
+                kind: "m.room.encrypted".to_string(),
+                sender: OUR_USER.to_string(),
+                content: olm_to_device_content(
+                    &peer_curve,
+                    &our_curve,
+                    message_type,
+                    &vodozemac::base64_encode(body),
+                ),
+            }
+        };
+
+        let event = deliver(
+            &mut session,
+            &json!({
+                "type": "m.secret.send",
+                "sender": OUR_USER,
+                "content": {"request_id": request_id, "secret": secret},
+            }),
+        );
+        let outcomes = match crypto.handle_to_device(&store, &[event]) {
+            Ok(o) => o,
+            Err(e) => panic!("handle_to_device: {e:#}"),
+        };
+        match outcomes.as_slice() {
+            [ToDeviceOutcome::Secret {
+                name,
+                secret: got,
+                request_id: got_id,
+            }] => {
+                assert_eq!(name, MEGOLM_BACKUP_SECRET);
+                assert_eq!(got, secret);
+                assert_eq!(got_id, &request_id);
+            }
+            other => panic!("expected one shared secret, got {}", other.len()),
+        }
+
+        // A secret answering a request id we never issued is dropped.
+        let stray = deliver(
+            &mut session,
+            &json!({
+                "type": "m.secret.send",
+                "sender": OUR_USER,
+                "content": {"request_id": "deadbeef", "secret": secret},
+            }),
+        );
+        match crypto.handle_to_device(&store, &[stray]) {
+            Ok(o) => assert!(o.is_empty(), "an unsolicited secret was accepted"),
+            Err(e) => panic!("handle_to_device: {e:#}"),
+        }
+    }
+
+    // ---------------------------------------------------------------- sha256
+
+    #[test]
+    fn sha256_matches_the_nist_vectors() {
+        let hex = |bytes: [u8; 32]| -> String {
+            let mut s = String::with_capacity(64);
+            for byte in bytes {
+                s.push_str(&format!("{byte:02x}"));
+            }
+            s
+        };
+
+        // Empty input, one block, and both padding shapes: 56 bytes needs a
+        // second block for the length, 64 bytes leaves no remainder at all.
+        assert_eq!(
+            hex(sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            hex(sha256(&[b'a'; 64])),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+        assert_eq!(
+            hex(sha256(
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+                  hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+                    .iter()
+                    .copied()
+                    .filter(|b| *b != b' ')
+                    .collect::<Vec<u8>>()
+                    .as_slice()
+            )),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
     }
 }

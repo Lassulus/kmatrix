@@ -14,6 +14,7 @@
 
 mod api;
 mod crypto;
+mod emoji;
 mod ipc;
 mod model;
 mod store;
@@ -282,12 +283,45 @@ fn process_sync(
     resp: SyncResponse,
 ) -> Result<()> {
     // 1. To-device first: a room key in this batch may unlock messages below.
+    //
+    // Verification events travel in the clear and are handled by their own
+    // state machine; everything else goes through the Olm path.
     if !resp.to_device.events.is_empty() {
-        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-        if let Some(c) = net.crypto.as_mut() {
-            if let Err(e) = c.handle_to_device(&db, &resp.to_device.events) {
-                eprintln!("kmatrixd: to-device: {e:#}");
+        let (verification, encrypted): (Vec<&ToDeviceEvent>, Vec<&ToDeviceEvent>) = resp
+            .to_device
+            .events
+            .iter()
+            .partition(|e| e.kind.starts_with("m.key.verification."));
+
+        let secrets = {
+            let owned: Vec<ToDeviceEvent> = encrypted
+                .into_iter()
+                .map(|e| ToDeviceEvent {
+                    kind: e.kind.clone(),
+                    sender: e.sender.clone(),
+                    content: e.content.clone(),
+                })
+                .collect();
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+            match net.crypto.as_mut() {
+                Some(c) => match c.handle_to_device(&db, &owned) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("kmatrixd: to-device: {e:#}");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            }
+        };
+        for outcome in secrets {
+            handle_secret(sh, api, session, outcome);
+        }
+
+        for ev in verification {
+            if let Err(e) = handle_verification_event(sh, api, session, ev) {
+                eprintln!("kmatrixd: verification: {e:#}");
             }
         }
     }
@@ -591,13 +625,16 @@ pub fn do_send(sh: &Arc<Shared>, room: &str, body: &str) -> Result<String> {
         let kq = api.keys_query(&members)?;
 
         let (devices, need) = {
-            let net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+            let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
             let c = net
                 .crypto
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow!("no crypto state"))?;
             let devices = c.parse_device_keys(&kq);
             let need = c.devices_needing_session(&devices);
+            // Keep the ed25519 keys around: device verification MACs are
+            // checked against them later.
+            c.remember_devices(&devices);
             (devices, need)
         };
 
@@ -785,5 +822,236 @@ pub fn try_restore_room(sh: &Arc<Shared>, room: &str) {
         Ok(0) => {}
         Ok(n) => eprintln!("kmatrixd: recovered {n} message(s) in {room} from key backup"),
         Err(e) => eprintln!("kmatrixd: backup restore for {room}: {e:#}"),
+    }
+}
+
+// ----------------------------------------------------------- verification
+
+/// Push a `VerifyStep` out: send its to-device events, tell the UI.
+fn apply_verify_step(
+    sh: &Arc<Shared>,
+    api: &Arc<Api>,
+    session: &Session,
+    step: crate::crypto::VerifyStep,
+) -> Result<()> {
+    for (kind, device, content) in step.send {
+        let messages = serde_json::json!({ &session.user_id: { device: content } });
+        let txn = format!("kmxv{}", now_ms());
+        if let Err(e) = api.send_to_device(&kind, &txn, &messages) {
+            eprintln!("kmatrixd: sending {kind}: {e:#}");
+        }
+    }
+
+    if let Some((transaction, device, indices)) = step.emoji {
+        let emoji: Vec<serde_json::Value> = indices
+            .iter()
+            .map(|i| {
+                let (glyph, name) = crate::emoji::SAS_EMOJI[(*i as usize) % 64];
+                serde_json::json!([glyph, name])
+            })
+            .collect();
+        sh.bus.publish(&serde_json::json!({
+            "event": "verification", "phase": "emoji",
+            "transaction": transaction, "device": device, "emoji": emoji
+        }));
+    }
+
+    if let Some(device) = step.done {
+        sh.bus.publish(&serde_json::json!({
+            "event": "verification", "phase": "done", "device": device
+        }));
+        // Now that the other device trusts us, ask it for the backup key
+        // instead of making the user type 58 base58 characters on e-ink.
+        request_backup_secret(sh, api, session);
+    }
+
+    if let Some(reason) = step.cancelled {
+        sh.bus.publish(&serde_json::json!({
+            "event": "verification", "phase": "cancelled", "reason": reason
+        }));
+    }
+    Ok(())
+}
+
+fn handle_verification_event(
+    sh: &Arc<Shared>,
+    api: &Arc<Api>,
+    session: &Session,
+    ev: &ToDeviceEvent,
+) -> Result<()> {
+    // The MAC step needs the peer's ed25519 key, and at the start of a
+    // verification nothing has queried our own devices yet. Do it once, here,
+    // so the registry is populated before the MACs arrive.
+    if ev.kind == "m.key.verification.request" || ev.kind == "m.key.verification.start" {
+        match api.keys_query(std::slice::from_ref(&session.user_id)) {
+            Ok(kq) => {
+                let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+                if let Some(c) = net.crypto.as_mut() {
+                    let devices = c.parse_device_keys(&kq);
+                    c.remember_devices(&devices);
+                }
+            }
+            Err(e) => eprintln!("kmatrixd: keys_query for verification: {e:#}"),
+        }
+    }
+
+    let step = {
+        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        c.handle_verification(
+            &session.user_id,
+            &session.device_id,
+            &ev.sender,
+            &ev.kind,
+            &ev.content,
+        )?
+    };
+    apply_verify_step(sh, api, session, step)
+}
+
+pub fn do_verify_confirm(sh: &Arc<Shared>, transaction: &str, confirm: bool) -> Result<()> {
+    let api = sh.api().ok_or_else(|| anyhow!("not logged in"))?;
+    let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
+    let step = {
+        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        c.confirm_verification(&session.user_id, &session.device_id, transaction, confirm)?
+    };
+    apply_verify_step(sh, &api, &session, step)
+}
+
+/// Ask our other devices for the key-backup private key over encrypted
+/// to-device secret sharing. Best effort: a device that does not trust us
+/// simply will not answer.
+fn request_backup_secret(sh: &Arc<Shared>, api: &Arc<Api>, session: &Session) {
+    let already = match sh.net.lock() {
+        Ok(g) => g.crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+        Err(_) => return,
+    };
+    if already {
+        return;
+    }
+
+    let devices = match api.keys_query(std::slice::from_ref(&session.user_id)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("kmatrixd: keys_query for secret request: {e:#}");
+            return;
+        }
+    };
+    let (request_id, content) = {
+        let mut net = match sh.net.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(c) = net.crypto.as_mut() else { return };
+        c.secret_request(&session.device_id, crate::crypto::MEGOLM_BACKUP_SECRET)
+    };
+    let _ = request_id;
+
+    let mut targets = serde_json::Map::new();
+    if let Some(list) = devices
+        .get("device_keys")
+        .and_then(|d| d.get(&session.user_id))
+        .and_then(|d| d.as_object())
+    {
+        for device_id in list.keys() {
+            if device_id == &session.device_id {
+                continue;
+            }
+            targets.insert(device_id.clone(), content.clone());
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let messages = serde_json::json!({ &session.user_id: targets });
+    let txn = format!("kmxs{}", now_ms());
+    if let Err(e) = api.send_to_device("m.secret.request", &txn, &messages) {
+        eprintln!("kmatrixd: secret request: {e:#}");
+    }
+}
+
+/// A secret arrived from one of our own verified devices.
+fn handle_secret(
+    sh: &Arc<Shared>,
+    api: &Arc<Api>,
+    session: &Session,
+    outcome: crate::crypto::ToDeviceOutcome,
+) {
+    let crate::crypto::ToDeviceOutcome::Secret {
+        name,
+        secret,
+        request_id,
+    } = outcome;
+    if name != crate::crypto::MEGOLM_BACKUP_SECRET {
+        return;
+    }
+
+    // The backup's public key pins what a valid secret must derive to, so a
+    // device that sends us the wrong key is rejected rather than silently
+    // producing sessions that decrypt nothing.
+    let expected = api.backup_version().ok().flatten();
+    let version = expected.as_ref().map(|b| b.version.clone());
+    let public = expected.as_ref().map(|b| b.public_key.clone());
+
+    let stored = {
+        let db = match sh.db.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut net = match sh.net.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(c) = net.crypto.as_mut() else { return };
+        let r = c.set_backup_key_base64(&db, &secret, public.as_deref());
+        if let (Ok(()), Some(v)) = (&r, &version) {
+            let _ = db.set_meta("backup_version", v);
+        }
+        r
+    };
+    match stored {
+        Ok(()) => {
+            eprintln!("kmatrixd: adopted {name} from secret sharing");
+            sh.bus.publish(&serde_json::json!({
+                "event": "verification", "phase": "secret", "name": name
+            }));
+        }
+        Err(e) => {
+            eprintln!("kmatrixd: rejecting shared secret: {e:#}");
+            return;
+        }
+    }
+
+    // Stop the other devices from answering the same request.
+    let cancel = {
+        let net = match sh.net.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        net.crypto
+            .as_ref()
+            .map(|c| c.secret_cancellation(&session.device_id, &request_id))
+    };
+    let Some(cancel) = cancel else { return };
+    if let Ok(devices) = api.keys_query(std::slice::from_ref(&session.user_id)) {
+        let mut targets = serde_json::Map::new();
+        if let Some(list) = devices
+            .get("device_keys")
+            .and_then(|d| d.get(&session.user_id))
+            .and_then(|d| d.as_object())
+        {
+            for device_id in list.keys() {
+                if device_id != &session.device_id {
+                    targets.insert(device_id.clone(), cancel.clone());
+                }
+            }
+        }
+        if !targets.is_empty() {
+            let messages = serde_json::json!({ &session.user_id: targets });
+            let txn = format!("kmxc{}", now_ms());
+            let _ = api.send_to_device("m.secret.request", &txn, &messages);
+        }
     }
 }

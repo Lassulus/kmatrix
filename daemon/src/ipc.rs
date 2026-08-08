@@ -287,6 +287,14 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
             json!({"id": id, "ok": true})
         }
 
+
+        Request::VerifyConfirm {
+            transaction,
+            confirm,
+        } => match crate::do_verify_confirm(sh, &transaction, confirm) {
+            Ok(()) => json!({"id": id, "ok": true}),
+            Err(e) => err(id, e),
+        },
         Request::BackupKey { key } => match crate::do_backup_key(sh, &key) {
             Ok(n) => json!({"id": id, "ok": true, "restored": n}),
             Err(e) => err(id, e),

@@ -42,6 +42,7 @@ match responses by `id` rather than by arrival order.
 | `mark_read` | `room`, `event_id` | `{ok}` |
 | `sync_now` | | `{ok}` — wake the sync loop immediately |
 | `backup_key` | `key` | `{ok, restored}` — see below |
+| `verify_confirm` | `transaction`, `confirm` | `{ok}` — answer to the emoji prompt |
 | `shutdown` | | `{ok}` |
 
 `state` is one of `logged_out`, `connecting`, `syncing`, `offline`.
@@ -65,6 +66,24 @@ sessions, which would cost tens of MB of RAM and rows on a 474 MB device.
 | `state` | `state`, `error?` | daemon state changed |
 | `rooms` | `rooms: [Room]` | room list changed (name, unread, preview) |
 | `messages` | `room`, `messages: [Message]` | new messages arrived |
+| `verification` | `phase`, … | interactive device verification, see below |
+
+### Verification
+
+The daemon is **responder only**: verification is started from another client
+(Element → Settings → Devices → Verify), never from here.
+
+| phase | fields | meaning |
+|---|---|---|
+| `emoji` | `transaction`, `device`, `emoji: [[glyph, name], …7]` | show these and await `verify_confirm` |
+| `done` | `device` | verified; the daemon now requests the backup key |
+| `cancelled` | `reason` | the other side or we gave up |
+| `secret` | `name` | a shared secret arrived and was accepted |
+
+After `done` the daemon sends `m.secret.request` for `m.megolm_backup.v1` to
+the account's other devices. A device that has just verified us will answer
+with the backup key over Olm, so the recovery key never has to be typed. The
+secret is validated against the backup's public key before being accepted.
 
 ## Types
 
