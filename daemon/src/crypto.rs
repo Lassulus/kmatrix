@@ -10,6 +10,9 @@
 //! | `olm`        | olm session id    | sender curve25519    |
 //! | `megolm_in`  | megolm session id | room id              |
 //! | `megolm_out` | room id           | message index        |
+//!
+//! The server-side key backup's private key is not a pickle: it lives in
+//! `meta` under `backup_key`, base64-encoded, next to the pickle key.
 
 use std::collections::HashMap;
 
@@ -18,11 +21,12 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use vodozemac::{
     megolm::{
-        GroupSession, GroupSessionPickle, InboundGroupSession, InboundGroupSessionPickle,
-        MegolmMessage, SessionConfig as MegolmConfig, SessionKey,
+        ExportedSessionKey, GroupSession, GroupSessionPickle, InboundGroupSession,
+        InboundGroupSessionPickle, MegolmMessage, SessionConfig as MegolmConfig, SessionKey,
     },
     olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig as OlmConfig, SessionPickle},
-    Curve25519PublicKey,
+    pk_encryption::{Message as PkMessage, PkDecryption},
+    Curve25519PublicKey, Curve25519SecretKey,
 };
 
 use crate::model::ToDeviceEvent;
@@ -39,6 +43,17 @@ const KIND_OLM: &str = "olm";
 const KIND_MEGOLM_IN: &str = "megolm_in";
 const KIND_MEGOLM_OUT: &str = "megolm_out";
 const PICKLE_KEY_META: &str = "pickle_key";
+const BACKUP_KEY_META: &str = "backup_key";
+
+/// Bitcoin's base58 alphabet, which the Matrix recovery key encoding uses.
+/// `0`, `O`, `I` and `l` are absent so they cannot be confused for each other.
+const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// The two bytes every recovery key starts with.
+const RECOVERY_KEY_PREFIX: [u8; 2] = [0x8b, 0x01];
+
+/// Prefix (2) + Curve25519 private key (32) + parity byte (1).
+const RECOVERY_KEY_LEN: usize = 35;
 
 /// One remote device, as far as we need to know it to send it a room key.
 #[derive(Debug, Clone)]
@@ -62,6 +77,10 @@ pub struct Crypto {
     /// key because that is the only identifier an incoming Olm message carries,
     /// which lets us attribute a key share without allocating a lookup key.
     known_devices: HashMap<String, (String, String)>,
+    /// The private half of the server-side key backup, once the user has typed
+    /// their recovery key. `Some` means we can pull single sessions out of the
+    /// backup on demand.
+    backup_key: Option<PkDecryption>,
 }
 
 impl Crypto {
@@ -124,6 +143,17 @@ impl Crypto {
 
         let known_devices = HashMap::new();
 
+        let backup_key = match store.get_meta(BACKUP_KEY_META)? {
+            Some(encoded) => match decode_backup_key(&encoded) {
+                Ok(secret) => Some(PkDecryption::from_key(secret)),
+                Err(e) => {
+                    eprintln!("kmatrixd: ignoring unreadable stored backup key: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         Ok(Crypto {
             account,
             pickle_key,
@@ -131,6 +161,7 @@ impl Crypto {
             outbound,
             olm_sessions,
             known_devices,
+            backup_key,
         })
     }
 
@@ -609,6 +640,130 @@ impl Crypto {
         self.outbound.contains_key(room)
     }
 
+    // ------------------------------------------------ server-side key backup
+
+    /// Validate a recovery key against the backup's advertised public key and
+    /// persist it. A key that does not match is rejected here, at the one point
+    /// where the user can still fix their typo, rather than silently producing
+    /// garbage plaintext on every later restore.
+    pub fn set_backup_key(
+        &mut self,
+        store: &Store,
+        recovery_key: &str,
+        expected_public_key: &str,
+    ) -> Result<()> {
+        let bytes = decode_recovery_key(recovery_key)?;
+        let decryption = PkDecryption::from_key(Curve25519SecretKey::from_slice(&bytes));
+        let derived = decryption.public_key().to_base64();
+        // Homeservers may pad their base64; vodozemac never does.
+        if derived != expected_public_key.trim().trim_end_matches('=') {
+            return Err(anyhow!(
+                "this recovery key does not match this backup: it unlocks {derived}, \
+                 but the backup was made for {expected_public_key}"
+            ));
+        }
+        store.set_meta(
+            BACKUP_KEY_META,
+            &base64::engine::general_purpose::STANDARD.encode(bytes),
+        )?;
+        self.backup_key = Some(decryption);
+        Ok(())
+    }
+
+    pub fn has_backup_key(&self) -> bool {
+        self.backup_key.is_some()
+    }
+
+    /// Decrypt one `/room_keys/keys` entry and register the Megolm session it
+    /// carries. `entry` is the server's per-session object: `session_data`
+    /// (`ciphertext`, `mac`, `ephemeral`) plus `first_message_index`.
+    ///
+    /// Returns `Ok(true)` when a session was imported and `Ok(false)` when the
+    /// entry was of no use: a non-Megolm algorithm, or a session we already
+    /// hold from an equally early or earlier message index.
+    ///
+    /// A backed up key carries no signature from the device that created the
+    /// session, so the imported session is unverified — the same trust level
+    /// libolm gives to key exports.
+    pub fn import_backup_session(
+        &mut self,
+        store: &Store,
+        room: &str,
+        session_id: &str,
+        entry: &Value,
+    ) -> Result<bool> {
+        let first_message_index = entry
+            .get("first_message_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // Reject before spending an ECDH: we may already hold this session from
+        // the same index or an earlier one.
+        if let Some(existing) = self.inbound.get(session_id) {
+            if u64::from(existing.first_known_index()) <= first_message_index {
+                return Ok(false);
+            }
+        }
+
+        let decryption = self
+            .backup_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("no backup recovery key has been entered"))?;
+        let data = entry
+            .get("session_data")
+            .ok_or_else(|| anyhow!("backup entry for {session_id} has no session_data"))?;
+        // The spec encodes these unpadded, but tolerate padding rather than
+        // fail a restore over four bytes of base64 trivia.
+        let part = |name: &str| -> Result<&str> {
+            data.get(name)
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('='))
+                .ok_or_else(|| anyhow!("backup session_data for {session_id} has no {name}"))
+        };
+        let message = PkMessage::from_base64(part("ciphertext")?, part("mac")?, part("ephemeral")?)
+            .context("decode backup session_data")?;
+        let plaintext = decryption
+            .decrypt(&message)
+            .context("decrypt backup session_data")?;
+
+        let decoded: Value =
+            serde_json::from_slice(&plaintext).context("parse backup session plaintext")?;
+        if decoded.get("algorithm").and_then(Value::as_str) != Some(MEGOLM_ALGORITHM) {
+            // Some other kind of backed up key. Not ours to import, and not
+            // worth failing over.
+            return Ok(false);
+        }
+        let session_key = decoded
+            .get("session_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("backed up session {session_id} has no session_key"))?;
+        // Backups hold the *exported* form: a ratchet at some index, without the
+        // creator's signature, so this is an import and not a `new`.
+        let exported = ExportedSessionKey::from_base64(session_key.trim_end_matches('='))
+            .context("decode exported megolm session key")?;
+        let session = InboundGroupSession::import(&exported, MegolmConfig::version_1());
+        let imported_id = session.session_id();
+        if imported_id != session_id {
+            return Err(anyhow!(
+                "backup entry filed under {session_id} actually holds session {imported_id}"
+            ));
+        }
+        // The entry's advertised index is a hint; the ratchet itself decides.
+        if let Some(existing) = self.inbound.get(&imported_id) {
+            if existing.first_known_index() <= session.first_known_index() {
+                return Ok(false);
+            }
+        }
+        store.put_pickle(
+            KIND_MEGOLM_IN,
+            &imported_id,
+            room,
+            &session.pickle().encrypt(&self.pickle_key),
+        )?;
+        self.inbound.insert(imported_id, session);
+        Ok(true)
+    }
+
     // ------------------------------------------------------------- internals
 
     fn persist_account(&self, store: &Store) -> Result<()> {
@@ -753,6 +908,91 @@ fn load_pickle_key(store: &Store) -> Result<[u8; 32]> {
     let key: [u8; 32] = rand::random();
     store.set_meta(PICKLE_KEY_META, &engine.encode(key))?;
     Ok(key)
+}
+
+/// Decode the megolm backup private key as stored in `meta`.
+fn decode_backup_key(encoded: &str) -> Result<Curve25519SecretKey> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .context("decode backup key")?;
+    let bytes: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("stored backup key is {} bytes, expected 32", raw.len()))?;
+    Ok(Curve25519SecretKey::from_slice(&bytes))
+}
+
+/// Decode a Matrix recovery key (the "security key" a client shows once): 35
+/// base58 bytes made of a two byte prefix, the 32 byte Curve25519 backup
+/// private key, and a parity byte chosen so that the XOR of all 35 bytes is 0.
+///
+/// Every failure mode gets its own message. The user typed this on an e-ink
+/// keyboard, and "one character is mistyped" versus "a character is missing"
+/// is the difference between re-reading one block and re-reading all thirteen.
+fn decode_recovery_key(s: &str) -> Result<[u8; 32]> {
+    // Clients display the key in blocks of four separated by spaces.
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return Err(anyhow!("recovery key is empty"));
+    }
+    let bytes = base58_decode(&compact)?;
+    if bytes.len() != RECOVERY_KEY_LEN {
+        return Err(anyhow!(
+            "recovery key decodes to {} bytes, expected {RECOVERY_KEY_LEN}: \
+             a character is missing or one too many",
+            bytes.len()
+        ));
+    }
+    if bytes[..2] != RECOVERY_KEY_PREFIX {
+        return Err(anyhow!(
+            "recovery key starts with {:02x}{:02x}, expected 8b01: this is not a Matrix \
+             recovery key",
+            bytes[0],
+            bytes[1]
+        ));
+    }
+    if bytes.iter().fold(0u8, |acc, b| acc ^ b) != 0 {
+        return Err(anyhow!(
+            "recovery key fails its parity check: at least one character is mistyped"
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes[2..34]);
+    Ok(key)
+}
+
+/// Base conversion from base58 to base256. The inner loop is quadratic in the
+/// output length, which is fine for the 35 bytes this is ever asked to decode.
+fn base58_decode(s: &str) -> Result<Vec<u8>> {
+    // Little-endian while we do arithmetic, reversed on the way out.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let mut carry = u32::from(base58_digit(c)?);
+        for byte in out.iter_mut() {
+            let acc = u32::from(*byte) * 58 + carry;
+            *byte = (acc & 0xff) as u8;
+            carry = acc >> 8;
+        }
+        while carry != 0 {
+            out.push((carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    // '1' is the base58 zero digit; leading ones are leading zero bytes, which
+    // the arithmetic above cannot express.
+    let leading = s.bytes().take_while(|&c| c == b'1').count();
+    out.resize(out.len() + leading, 0);
+    out.reverse();
+    Ok(out)
+}
+
+fn base58_digit(c: char) -> Result<u8> {
+    if c.is_ascii() {
+        if let Some(digit) = BASE58_ALPHABET.iter().position(|&a| a == c as u8) {
+            return Ok(digit as u8);
+        }
+    }
+    Err(anyhow!("'{c}' is not a valid base58 character"))
 }
 
 fn signatures_for(user_id: &str, device_id: &str, signature: &str) -> Value {
@@ -1246,6 +1486,350 @@ mod tests {
         };
         if let Err(e) = bob.decrypt(&session_id, &ciphertext) {
             panic!("bob could not decrypt after reload: {e:#}");
+        }
+    }
+
+    /// Base256 to base58, the inverse of [`base58_decode`]. Only the tests need
+    /// this: the daemon never hands a recovery key back to anyone.
+    fn base58_encode(bytes: &[u8]) -> String {
+        let mut digits: Vec<u8> = Vec::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            let mut carry = u32::from(byte);
+            for digit in digits.iter_mut() {
+                let acc = u32::from(*digit) * 256 + carry;
+                *digit = (acc % 58) as u8;
+                carry = acc / 58;
+            }
+            while carry != 0 {
+                digits.push((carry % 58) as u8);
+                carry /= 58;
+            }
+        }
+        let mut out = String::with_capacity(digits.len() + 1);
+        for _ in bytes.iter().take_while(|&&b| b == 0) {
+            out.push('1');
+        }
+        for digit in digits.iter().rev() {
+            match BASE58_ALPHABET.get(usize::from(*digit)) {
+                Some(c) => out.push(char::from(*c)),
+                None => panic!("base58 digit {digit} out of range"),
+            }
+        }
+        out
+    }
+
+    /// The 35 byte recovery key blob for a private key: prefix, key, parity.
+    fn recovery_blob(key: &[u8; 32]) -> [u8; RECOVERY_KEY_LEN] {
+        let mut blob = [0u8; RECOVERY_KEY_LEN];
+        blob[0] = RECOVERY_KEY_PREFIX[0];
+        blob[1] = RECOVERY_KEY_PREFIX[1];
+        blob[2..34].copy_from_slice(key);
+        blob[34] = blob[..34].iter().fold(0u8, |acc, b| acc ^ b);
+        blob
+    }
+
+    fn group_in_fours(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + s.len() / 4);
+        for (i, c) in s.chars().enumerate() {
+            if i != 0 && i % 4 == 0 {
+                out.push(' ');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn expect_recovery_error(encoded: &str) -> String {
+        match decode_recovery_key(encoded) {
+            Ok(_) => panic!("decode_recovery_key accepted {encoded}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn backup_public_key(key: &[u8; 32]) -> String {
+        PkDecryption::from_key(Curve25519SecretKey::from_slice(key))
+            .public_key()
+            .to_base64()
+    }
+
+    /// Build the object a homeserver stores for one backed up session: the key
+    /// JSON encrypted to the backup's public key with the same hybrid scheme
+    /// the daemon has to undo.
+    fn backup_entry(public_key: &str, plaintext: &Value, first_message_index: u64) -> Value {
+        use vodozemac::pk_encryption::PkEncryption;
+
+        let public = match Curve25519PublicKey::from_base64(public_key) {
+            Ok(k) => k,
+            Err(e) => panic!("bad backup public key: {e}"),
+        };
+        let raw = match serde_json::to_vec(plaintext) {
+            Ok(v) => v,
+            Err(e) => panic!("serialize backup plaintext: {e}"),
+        };
+        let message = match PkEncryption::from_key(public).encrypt(&raw) {
+            Ok(m) => m,
+            Err(e) => panic!("encrypt backup session: {e}"),
+        };
+        json!({
+            "first_message_index": first_message_index,
+            "forwarded_count": 0,
+            "is_verified": true,
+            "session_data": {
+                "ciphertext": vodozemac::base64_encode(&message.ciphertext),
+                "mac": vodozemac::base64_encode(&message.mac),
+                "ephemeral": message.ephemeral_key.to_base64(),
+            },
+        })
+    }
+
+    /// The round-trip test below pairs our decoder with our own test encoder,
+    /// so a shared misunderstanding would cancel out. These are the classic
+    /// Bitcoin base58 vectors, which pin the encoding down from the outside.
+    #[test]
+    fn base58_matches_the_bitcoin_vectors() {
+        let vectors: [(&[u8], &str); 5] = [
+            (b"a", "2g"),
+            (b"bbb", "a3gV"),
+            (b"ccc", "aPEr"),
+            (b"simply a long string", "2cFupjhnEsSn59qHXstmK2ffpLv2"),
+            (&[0x00, 0x00, 0x00, 0x28, 0x7f, 0xb4, 0xcd], "111233QC4"),
+        ];
+        for (bytes, encoded) in vectors {
+            match base58_decode(encoded) {
+                Ok(decoded) => assert_eq!(decoded, bytes, "decoding {encoded}"),
+                Err(e) => panic!("base58_decode({encoded}): {e:#}"),
+            }
+            assert_eq!(base58_encode(bytes), encoded, "encoding {encoded}");
+        }
+
+        match base58_decode("1") {
+            Ok(decoded) => assert_eq!(decoded, [0u8], "'1' is the zero digit"),
+            Err(e) => panic!("base58_decode(1): {e:#}"),
+        }
+    }
+
+    #[test]
+    fn recovery_key_round_trip_and_rejections() {
+        let key: [u8; 32] = rand::random();
+        let encoded = base58_encode(&recovery_blob(&key));
+        match decode_recovery_key(&encoded) {
+            Ok(decoded) => assert_eq!(decoded, key),
+            Err(e) => panic!("decode_recovery_key: {e:#}"),
+        }
+
+        // Wrong prefix, with the parity byte fixed up so that the prefix is
+        // unambiguously what gets rejected.
+        let mut blob = recovery_blob(&key);
+        blob[0] = 0x8c;
+        blob[34] ^= 0x8b ^ 0x8c;
+        let err = expect_recovery_error(&base58_encode(&blob));
+        assert!(err.contains("not a Matrix recovery key"), "{err}");
+
+        // Bad parity: one bit off in the parity byte itself.
+        let mut blob = recovery_blob(&key);
+        blob[34] ^= 0x01;
+        let err = expect_recovery_error(&base58_encode(&blob));
+        assert!(err.contains("parity"), "{err}");
+
+        // Wrong length: 34 bytes instead of 35.
+        let blob = recovery_blob(&key);
+        let err = expect_recovery_error(&base58_encode(&blob[..34]));
+        assert!(err.contains("expected 35"), "{err}");
+
+        // '0' is not in the base58 alphabet.
+        let err = expect_recovery_error(&format!("0{encoded}"));
+        assert!(err.contains("not a valid base58 character"), "{err}");
+
+        let err = expect_recovery_error("   ");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn recovery_key_ignores_grouping() {
+        let key: [u8; 32] = rand::random();
+        let encoded = base58_encode(&recovery_blob(&key));
+        let grouped = group_in_fours(&encoded);
+        assert!(grouped.contains(' '));
+        assert_ne!(grouped, encoded);
+
+        match decode_recovery_key(&grouped) {
+            Ok(decoded) => assert_eq!(decoded, key),
+            Err(e) => panic!("grouped recovery key rejected: {e:#}"),
+        }
+        match decode_recovery_key(&format!("\n {grouped} \t\n")) {
+            Ok(decoded) => assert_eq!(decoded, key),
+            Err(e) => panic!("surrounding whitespace rejected: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn set_backup_key_checks_the_public_key() {
+        let temp = TempStore::new("backup-key");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        assert!(!crypto.has_backup_key());
+
+        let key: [u8; 32] = rand::random();
+        let recovery = base58_encode(&recovery_blob(&key));
+        let other: [u8; 32] = rand::random();
+
+        // A valid recovery key for a *different* backup must not be accepted.
+        let err = match crypto.set_backup_key(&store, &recovery, &backup_public_key(&other)) {
+            Ok(()) => panic!("a recovery key for another backup was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("does not match this backup"), "{err}");
+        assert!(!crypto.has_backup_key());
+
+        // Padded base64 from the server is still the same key.
+        let padded = format!("{}=", backup_public_key(&key));
+        if let Err(e) = crypto.set_backup_key(&store, &recovery, &padded) {
+            panic!("set_backup_key: {e:#}");
+        }
+        assert!(crypto.has_backup_key());
+
+        // And it survives a restart of the daemon.
+        drop(crypto);
+        let store = temp.open();
+        let crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("reload: {e:#}"),
+        };
+        assert!(crypto.has_backup_key());
+    }
+
+    #[test]
+    fn backup_session_import_round_trip() {
+        let temp = TempStore::new("backup-import");
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+
+        let key: [u8; 32] = rand::random();
+        let public = backup_public_key(&key);
+        let recovery = base58_encode(&recovery_blob(&key));
+        if let Err(e) = crypto.set_backup_key(&store, &recovery, &public) {
+            panic!("set_backup_key: {e:#}");
+        }
+
+        // A session from a device we have never talked to, of the kind that
+        // predates this device entirely.
+        let room = "!backup:example.org";
+        let mut sender = GroupSession::new(MegolmConfig::version_1());
+        let mut sender_inbound = InboundGroupSession::from(&sender);
+        let session_id = sender_inbound.session_id();
+        let exported = sender_inbound.export_at_first_known_index().to_base64();
+
+        let first = sender.encrypt(b"{\"body\":\"first\"}").to_base64();
+        let envelope = json!({
+            "type": "m.room.message",
+            "room_id": room,
+            "content": {"msgtype": "m.text", "body": "from before this device existed"},
+        });
+        let raw = match serde_json::to_vec(&envelope) {
+            Ok(v) => v,
+            Err(e) => panic!("serialize envelope: {e}"),
+        };
+        let second = sender.encrypt(&raw).to_base64();
+
+        // Before the import there is no session at all.
+        let err = match crypto.decrypt(&session_id, &first) {
+            Ok(_) => panic!("decrypted without the session"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("unknown session"), "{err}");
+
+        let plaintext = json!({
+            "algorithm": MEGOLM_ALGORITHM,
+            "sender_key": crypto.curve25519_key(),
+            "sender_claimed_keys": {"ed25519": crypto.ed25519_key()},
+            "forwarding_curve25519_key_chain": [],
+            "session_key": exported,
+        });
+        let entry = backup_entry(&public, &plaintext, 0);
+
+        match crypto.import_backup_session(&store, room, &session_id, &entry) {
+            Ok(true) => {}
+            Ok(false) => panic!("a session we did not have was not imported"),
+            Err(e) => panic!("import_backup_session: {e:#}"),
+        }
+
+        // The imported session decrypts from the very first message index.
+        match crypto.decrypt(&session_id, &first) {
+            Ok(p) => assert_eq!(p, "{\"body\":\"first\"}"),
+            Err(e) => panic!("decrypt after import: {e:#}"),
+        }
+
+        // Re-importing the same entry changes nothing.
+        match crypto.import_backup_session(&store, room, &session_id, &entry) {
+            Ok(false) => {}
+            Ok(true) => panic!("re-imported a session we already had"),
+            Err(e) => panic!("second import: {e:#}"),
+        }
+
+        // A backup entry that starts at a later index must not replace the one
+        // we hold: that would forget the messages in between.
+        let late_key = match sender_inbound.export_at(2) {
+            Some(k) => k.to_base64(),
+            None => panic!("could not export at index 2"),
+        };
+        let mut late_plaintext = plaintext.clone();
+        late_plaintext["session_key"] = Value::String(late_key);
+        let late_entry = backup_entry(&public, &late_plaintext, 2);
+        match crypto.import_backup_session(&store, room, &session_id, &late_entry) {
+            Ok(false) => {}
+            Ok(true) => panic!("a later-index session replaced an earlier one"),
+            Err(e) => panic!("late import: {e:#}"),
+        }
+        let plain = match crypto.decrypt(&session_id, &second) {
+            Ok(p) => p,
+            Err(e) => panic!("decrypt at index 1 after the late entry: {e:#}"),
+        };
+        match serde_json::from_str::<Value>(&plain) {
+            Ok(v) => assert_eq!(v, envelope),
+            Err(e) => panic!("parse plaintext: {e}"),
+        }
+
+        // A non-Megolm backup entry is skipped, not an error.
+        let mut other_algorithm = plaintext.clone();
+        other_algorithm["algorithm"] = Value::String("m.something.else".to_string());
+        let other_entry = backup_entry(&public, &other_algorithm, 0);
+        match crypto.import_backup_session(&store, "!other:example.org", "other-id", &other_entry) {
+            Ok(false) => {}
+            Ok(true) => panic!("imported a non-megolm backup entry"),
+            Err(e) => panic!("unexpected error for a foreign algorithm: {e:#}"),
+        }
+
+        // Without a recovery key there is nothing to try.
+        let bare_temp = TempStore::new("backup-none");
+        let bare_store = bare_temp.open();
+        let mut bare = match Crypto::load_or_create(&bare_store) {
+            Ok(c) => c,
+            Err(e) => panic!("load_or_create: {e:#}"),
+        };
+        assert!(!bare.has_backup_key());
+        let err = match bare.import_backup_session(&bare_store, room, &session_id, &entry) {
+            Ok(_) => panic!("imported without a backup key"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("no backup recovery key"), "{err}");
+
+        // The imported session survives a restart.
+        drop(crypto);
+        let store = temp.open();
+        let mut crypto = match Crypto::load_or_create(&store) {
+            Ok(c) => c,
+            Err(e) => panic!("reload: {e:#}"),
+        };
+        let third = sender.encrypt(b"{\"body\":\"third\"}").to_base64();
+        match crypto.decrypt(&session_id, &third) {
+            Ok(p) => assert_eq!(p, "{\"body\":\"third\"}"),
+            Err(e) => panic!("decrypt after reload: {e:#}"),
         }
     }
 }

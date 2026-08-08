@@ -50,6 +50,14 @@ pub struct Message {
     pub encrypted: bool,
     pub decrypted: bool,
     pub mine: bool,
+    /// Kept only for `m.room.encrypted` events we could not decrypt, so a
+    /// room key recovered later (from the server-side backup) can turn the
+    /// placeholder into the real message without refetching from the server.
+    /// Cleared once decrypted. Not part of the IPC surface.
+    #[serde(skip)]
+    pub session_id: Option<String>,
+    #[serde(skip)]
+    pub ciphertext: Option<String>,
 }
 
 // --------------------------------------------------------------------- IPC
@@ -109,6 +117,11 @@ pub enum Request {
         event_id: String,
     },
     SyncNow,
+    /// Supply the server-side key-backup recovery key ("Security Key"), so
+    /// history predating this device can be decrypted on demand.
+    BackupKey {
+        key: String,
+    },
     Shutdown,
 }
 

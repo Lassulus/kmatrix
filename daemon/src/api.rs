@@ -91,6 +91,28 @@ struct MatrixError {
     error: Option<String>,
 }
 
+/// The account's current room-key backup.
+pub struct BackupInfo {
+    pub version: String,
+    pub algorithm: String,
+    pub public_key: String,
+}
+
+#[derive(Deserialize)]
+struct BackupVersionResponse {
+    version: String,
+    algorithm: String,
+    auth_data: BackupAuthData,
+}
+
+/// `auth_data` is algorithm-specific; for
+/// `m.megolm_backup.v1.curve25519-aes-sha2` the field we need is the public
+/// half of the backup key, which the recovery key must reproduce.
+#[derive(Deserialize)]
+struct BackupAuthData {
+    public_key: String,
+}
+
 // ---------------------------------------------------------------------- impl
 
 impl Api {
@@ -263,6 +285,46 @@ impl Api {
             .content_type("application/json")
             .send("{}")?;
         discard(res, "read_receipt")
+    }
+
+    /// Current server-side room-key backup, if the account has one.
+    /// A 404 (`M_NOT_FOUND`) means no backup exists and is not an error.
+    pub fn backup_version(&self) -> Result<Option<BackupInfo>> {
+        let url = self.url("/_matrix/client/v3/room_keys/version");
+        let res = self.get_auth(&url)?.call()?;
+        if res.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let parsed: BackupVersionResponse = finish(res, "backup_version")?;
+        Ok(Some(BackupInfo {
+            version: parsed.version,
+            algorithm: parsed.algorithm,
+            public_key: parsed.auth_data.public_key,
+        }))
+    }
+
+    /// One session out of the backup. Deliberately per-session rather than a
+    /// bulk `GET /room_keys/keys`: this account's backup holds 51k sessions,
+    /// and importing them all would cost tens of MB of RAM and rows on a
+    /// device with 474 MB total. A 404 means the backup has no such session.
+    pub fn backup_session(
+        &self,
+        version: &str,
+        room: &str,
+        session_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/room_keys/keys/{}/{}?version={}",
+            encode_segment(room),
+            encode_segment(session_id),
+            encode_segment(version)
+        ));
+        let res = self.get_auth(&url)?.call()?;
+        if res.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let parsed: serde_json::Value = finish(res, "backup_session")?;
+        Ok(Some(parsed))
     }
 
     // ------------------------------------------------------------- internals

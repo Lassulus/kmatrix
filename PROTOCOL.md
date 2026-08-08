@@ -41,9 +41,22 @@ match responses by `id` rather than by arrival order.
 | `send` | `room`, `body` | `{ok, event_id}` |
 | `mark_read` | `room`, `event_id` | `{ok}` |
 | `sync_now` | | `{ok}` — wake the sync loop immediately |
+| `backup_key` | `key` | `{ok, restored}` — see below |
 | `shutdown` | | `{ok}` |
 
 `state` is one of `logged_out`, `connecting`, `syncing`, `offline`.
+`status` also returns `backup`: whether a key-backup recovery key is held.
+
+`backup_key` takes the server-side key backup's recovery key (Element calls it
+the Security Key), validates it against the backup's advertised public key —
+a wrong key is rejected immediately rather than producing garbage later — and
+stores it. `restored` counts messages decrypted right away in the few most
+recent rooms.
+
+Recovery is otherwise **lazy**: `messages` triggers a per-room, per-session
+fetch from the backup for that room's undecryptable history. A bulk
+`GET /room_keys/keys` is deliberately not used; a real account here holds ~51k
+sessions, which would cost tens of MB of RAM and rows on a 474 MB device.
 
 ## Events
 

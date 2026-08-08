@@ -76,6 +76,7 @@ function KMatrix:init()
     self.user_id = nil
     self.device_id = nil
     self.homeserver = nil
+    self.backup = nil
     self.reconnect_on_resume = false
     self.ui.menu:registerToMainMenu(self)
 end
@@ -263,6 +264,7 @@ function KMatrix:refreshStatus(done)
             self.user_id = resp.user_id
             self.device_id = resp.device_id
             self.homeserver = resp.homeserver
+            self.backup = resp.backup
         end
         self:updateSubtitle()
         if done then done(resp.ok == true) end
@@ -271,6 +273,10 @@ end
 
 function KMatrix:statusText()
     local label = STATE_LABELS[self.state or "offline"] or self.state
+    -- Terse on purpose: this is a title bar on e-ink.
+    if self.backup == false and self.state ~= "logged_out" then
+        label = label .. "  ·  " .. _("no key backup")
+    end
     if self.user_id then
         return self.user_id .. "  ·  " .. label
     end
@@ -364,6 +370,7 @@ function KMatrix:logout()
         self.state = "logged_out"
         self.rooms = {}
         self.user_id = nil
+        self.backup = nil
         if self.timeline then
             UIManager:close(self.timeline.menu)
             self.timeline = nil
@@ -380,6 +387,79 @@ function KMatrix:syncNow()
             self:notify(T(_("Sync failed: %1"), tostring(resp.error)))
         end
     end)
+end
+
+--[[ Key backup ]]--
+
+--- Asks for the Security Key that unlocks the server-side room-key backup.
+-- The key is base58 and mixed case, so the field stays readable: a masked
+-- field would make a single mistyped character impossible to spot.
+function KMatrix:showKeyBackupDialog()
+    if not self:daemonReady() then return end
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Key backup recovery key"),
+        description = _("The Security Key that Element showed you when the key backup was set up. It unlocks messages older than this device."),
+        input = "",
+        input_type = "text",
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Restore"),
+                    is_enter_default = true,
+                    callback = function()
+                        local key = util.trim(dialog:getInputText() or "")
+                        if key == "" then
+                            self:notify(_("Enter the recovery key first."))
+                            return
+                        end
+                        UIManager:close(dialog)
+                        self:restoreKeyBackup(key)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function KMatrix:restoreKeyBackup(key)
+    if not self:daemonReady() then return end
+    self:setBusy(_("Restoring key backup…"))
+    self.ipc:request("backup_key", { key = key }, function(resp)
+        self:clearBusy()
+        if not resp.ok then
+            -- The daemon words these precisely (bad checksum, wrong backup,
+            -- …), and which one it is decides what the user has to fix.
+            self:notify(resp.error and tostring(resp.error)
+                or _("Could not restore the key backup."), 5)
+            return
+        end
+        self.backup = true
+        self:notify(_("Key backup restored. Older messages will decrypt as you open rooms."), 5)
+        self:refreshVisibleView()
+    end)
+end
+
+--- Re-asks the daemon for whatever is on screen, so bodies that only became
+-- readable now replace their locked placeholders. Both paths repaint through
+-- Menu:switchItemTable, exactly like the `messages` and `rooms` events do.
+function KMatrix:refreshVisibleView()
+    self:updateSubtitle()
+    if self.timeline then
+        self:requestMessages(self.timeline.room)
+    end
+    if self.room_menu then
+        self:requestRooms()
+    end
 end
 
 function KMatrix:shutdownDaemon()
@@ -494,6 +574,14 @@ function KMatrix:showAccountDialog()
             callback = function()
                 UIManager:close(dialog)
                 self:syncNow()
+            end,
+        }},
+        {{
+            text = "\u{f084} " .. _("Restore key backup"), -- 'key' sign
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:showKeyBackupDialog()
             end,
         }},
         {{
@@ -619,7 +707,19 @@ function KMatrix:refreshTimeline()
     local timeline = self.timeline
     if not timeline then return end
     local items = self:messageItems()
-    timeline.menu:switchItemTable(nil, items, #items)
+    local menu = timeline.menu
+    -- Do NOT pass an itemnumber here. With items_max_lines set,
+    -- switchItemTable resolves the page via Menu:getPageNumber(), which walks
+    -- self.page_items -- but page_items is only rebuilt later, by
+    -- setupItemHeights() inside updateItems(). On the first population the
+    -- previous table was empty, so getPageNumber() falls out of its loop and
+    -- returns #page_items == 0. updateItems() then clamps only page > page_num,
+    -- never page < 1, so the menu renders page 0: blank, i.e. "No items".
+    -- The room list dodged this by passing -1 (keep current page).
+    menu:switchItemTable(nil, items)
+    if #items > 0 and (menu.page_num or 1) > 1 then
+        menu:onLastPage() -- newest message sits at the bottom
+    end
 end
 
 function KMatrix:markRead()

@@ -12,7 +12,17 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["rustls"] }
-vodozemac = "0.10"
+# `insecure-pk-encryption` gates vodozemac's PkDecryption, which IS
+# m.megolm_backup.v1.curve25519-aes-sha2 -- there is no other way to read a
+# Matrix server-side key backup. Same crate, same version, no new deps.
+#
+# The "insecure" label is about the spec'd algorithm, not the implementation:
+# it provides no authentication of the ciphertext, and encrypting requires
+# only the public backup key the homeserver already stores. A hostile server
+# can therefore forge backup entries. Sessions imported from backup are lower
+# provenance than keys received over Olm; we still validate the recovery key
+# against the advertised public key so a server cannot swap the whole backup.
+vodozemac = { version = "0.10", features = ["insecure-pk-encryption"] }
 
 [profile.release]
 opt-level = "z"

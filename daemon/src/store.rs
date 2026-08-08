@@ -34,7 +34,12 @@ CREATE TABLE IF NOT EXISTS message (
     body      TEXT NOT NULL,
     encrypted INTEGER NOT NULL,
     decrypted INTEGER NOT NULL,
-    mine      INTEGER NOT NULL
+    mine      INTEGER NOT NULL,
+    -- Set only while an encrypted event is still undecryptable, so that a room
+    -- key recovered from the server-side backup later can turn the placeholder
+    -- into the real message without refetching it. Cleared on success.
+    session_id TEXT,
+    ciphertext TEXT
 );
 CREATE INDEX IF NOT EXISTS message_room_ts ON message(room, ts);
 CREATE TABLE IF NOT EXISTS pickle (
@@ -83,6 +88,7 @@ impl Store {
             .context("set busy timeout")?;
 
         conn.execute_batch(SCHEMA).context("create schema")?;
+        migrate(&conn)?;
         Ok(Store { conn })
     }
 
@@ -246,11 +252,14 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO message
-                     (event_id, room, sender, ts, body, encrypted, decrypted, mine)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     (event_id, room, sender, ts, body, encrypted, decrypted, mine,
+                      session_id, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(event_id) DO UPDATE SET
-                     body      = excluded.body,
-                     decrypted = excluded.decrypted",
+                     body       = excluded.body,
+                     decrypted  = excluded.decrypted,
+                     session_id = excluded.session_id,
+                     ciphertext = excluded.ciphertext",
                 params![
                     m.event_id,
                     m.room,
@@ -260,6 +269,8 @@ impl Store {
                     m.encrypted as i64,
                     m.decrypted as i64,
                     m.mine as i64,
+                    m.session_id,
+                    m.ciphertext,
                 ],
             )
             .with_context(|| format!("insert message {}", m.event_id))?;
@@ -272,7 +283,8 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT event_id, room, sender, ts, body, encrypted, decrypted, mine
+                "SELECT event_id, room, sender, ts, body, encrypted, decrypted, mine,
+                        session_id, ciphertext
                  FROM message WHERE room = ?1
                  ORDER BY ts DESC, event_id DESC LIMIT ?2",
             )
@@ -288,6 +300,8 @@ impl Store {
                     encrypted: row.get::<_, i64>(5)? != 0,
                     decrypted: row.get::<_, i64>(6)? != 0,
                     mine: row.get::<_, i64>(7)? != 0,
+                    session_id: row.get(8)?,
+                    ciphertext: row.get(9)?,
                 })
             })
             .with_context(|| format!("query messages for {room}"))?;
@@ -297,6 +311,56 @@ impl Store {
         }
         out.reverse();
         Ok(out)
+    }
+
+    /// Undecryptable messages in a room, newest first, that still carry the
+    /// ciphertext needed to retry. Returns `(event_id, session_id, ciphertext)`.
+    ///
+    /// Rows written before the ciphertext columns existed, and rows we can
+    /// already read, are skipped: there is nothing to retry for either.
+    pub fn undecrypted_in_room(
+        &self,
+        room: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT event_id, session_id, ciphertext
+                 FROM message
+                 WHERE room = ?1 AND encrypted = 1 AND decrypted = 0
+                   AND session_id IS NOT NULL AND ciphertext IS NOT NULL
+                 ORDER BY ts DESC, event_id DESC LIMIT ?2",
+            )
+            .context("prepare undecrypted message query")?;
+        let rows = stmt
+            .query_map(params![room, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .with_context(|| format!("query undecrypted messages for {room}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("read undecrypted message row")?);
+        }
+        Ok(out)
+    }
+
+    /// A message we could not read before has been decrypted with a key
+    /// recovered from the backup: replace the placeholder body in place and drop
+    /// the retained ciphertext, which has done its job.
+    ///
+    /// A row that is no longer there is not an error; the backlog may have been
+    /// trimmed between listing the retries and finishing them.
+    pub fn upgrade_message(&self, event_id: &str, body: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE message
+                 SET body = ?2, decrypted = 1, session_id = NULL, ciphertext = NULL
+                 WHERE event_id = ?1",
+                params![event_id, body],
+            )
+            .with_context(|| format!("upgrade message {event_id}"))?;
+        Ok(())
     }
 
     // -------------------------------------------------------------- pickles
@@ -330,6 +394,28 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Bring an existing database up to the current schema. `CREATE TABLE IF NOT
+/// EXISTS` leaves an already-present table exactly as it was, so columns added
+/// after a release have to be bolted on by hand — a device holding thousands of
+/// messages cannot afford to have the table dropped and rebuilt.
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut present: Vec<String> = Vec::new();
+    conn.pragma(None, "table_info", "message", |row| {
+        present.push(row.get(1)?);
+        Ok(())
+    })
+    .context("inspect message columns")?;
+
+    for column in ["session_id", "ciphertext"] {
+        if present.iter().any(|c| c == column) {
+            continue;
+        }
+        conn.execute_batch(&format!("ALTER TABLE message ADD COLUMN {column} TEXT;"))
+            .with_context(|| format!("add message column {column}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -379,7 +465,17 @@ mod tests {
             encrypted: true,
             decrypted,
             mine: false,
+            session_id: None,
+            ciphertext: None,
         }
+    }
+
+    /// An undecryptable message that still has everything needed for a retry.
+    fn retryable(event_id: &str, ts: u64) -> Message {
+        let mut m = msg(event_id, ts, "[encrypted]", false);
+        m.session_id = Some(format!("S-{event_id}"));
+        m.ciphertext = Some(format!("C-{event_id}"));
+        m
     }
 
     #[test]
@@ -658,5 +754,175 @@ mod tests {
             store.get_meta("sync_token").expect("get").as_deref(),
             Some("s42")
         );
+    }
+
+    #[test]
+    fn migration_adds_the_ciphertext_columns_to_an_old_database() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create db directory");
+        }
+
+        // A database as written by a build that predates the two columns.
+        {
+            let conn = Connection::open(&path).expect("open raw connection");
+            conn.execute_batch(
+                "CREATE TABLE message (
+                     event_id  TEXT PRIMARY KEY,
+                     room      TEXT NOT NULL,
+                     sender    TEXT NOT NULL,
+                     ts        INTEGER NOT NULL,
+                     body      TEXT NOT NULL,
+                     encrypted INTEGER NOT NULL,
+                     decrypted INTEGER NOT NULL,
+                     mine      INTEGER NOT NULL
+                 );
+                 INSERT INTO message
+                 VALUES ('$old', '!r:example.org', '@alice:example.org', 5, '[encrypted]', 1, 0, 0);",
+            )
+            .expect("create pre-migration schema");
+        }
+
+        // Opening migrates in place: the row survives and the new columns work.
+        let store = tmp.open();
+        store
+            .insert_message(&retryable("$old", 5))
+            .expect("record ciphertext");
+
+        let rows = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(rows.len(), 1, "migration must not drop or duplicate rows");
+        assert_eq!(rows[0].session_id.as_deref(), Some("S-$old"));
+        assert_eq!(rows[0].ciphertext.as_deref(), Some("C-$old"));
+
+        // Idempotent: a second open finds both columns and leaves them alone.
+        drop(store);
+        let store = tmp.open();
+        let rows = store
+            .recent_messages("!r:example.org", 50)
+            .expect("recent after reopen");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ciphertext.as_deref(), Some("C-$old"));
+    }
+
+    #[test]
+    fn decrypting_clears_the_stored_ciphertext() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .insert_message(&retryable("$evt", 100))
+            .expect("insert placeholder");
+        assert_eq!(
+            store
+                .undecrypted_in_room("!r:example.org", 50)
+                .expect("undecrypted"),
+            vec![(
+                "$evt".to_string(),
+                "S-$evt".to_string(),
+                "C-$evt".to_string()
+            )]
+        );
+
+        // The room key showed up: body and flag are upgraded, and the ciphertext
+        // is dropped, since keeping it costs device flash for nothing.
+        store
+            .insert_message(&msg("$evt", 100, "the real text", true))
+            .expect("upgrade");
+
+        let rows = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "the real text");
+        assert!(rows[0].decrypted);
+        assert!(rows[0].session_id.is_none(), "session id must be cleared");
+        assert!(rows[0].ciphertext.is_none(), "ciphertext must be cleared");
+        assert!(store
+            .undecrypted_in_room("!r:example.org", 50)
+            .expect("undecrypted after")
+            .is_empty());
+    }
+
+    #[test]
+    fn upgrade_message_replaces_the_placeholder_in_place() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store.insert_message(&retryable("$evt", 100)).expect("insert");
+        store.insert_message(&retryable("$keep", 90)).expect("insert");
+
+        store
+            .upgrade_message("$evt", "recovered from the backup")
+            .expect("upgrade");
+
+        let rows = store.recent_messages("!r:example.org", 50).expect("recent");
+        let upgraded = match rows.iter().find(|m| m.event_id == "$evt") {
+            Some(m) => m,
+            None => panic!("the upgraded message disappeared"),
+        };
+        assert_eq!(upgraded.body, "recovered from the backup");
+        assert!(upgraded.decrypted);
+        assert!(upgraded.session_id.is_none(), "session id must be cleared");
+        assert!(upgraded.ciphertext.is_none(), "ciphertext must be cleared");
+
+        // Only that row changed, and it is no longer up for retry.
+        let pending = store
+            .undecrypted_in_room("!r:example.org", 50)
+            .expect("undecrypted");
+        assert_eq!(
+            pending,
+            vec![(
+                "$keep".to_string(),
+                "S-$keep".to_string(),
+                "C-$keep".to_string()
+            )]
+        );
+
+        // A row that is already gone is not an error.
+        store
+            .upgrade_message("$vanished", "nothing to do")
+            .expect("upgrade missing row");
+    }
+
+    #[test]
+    fn undecrypted_in_room_only_returns_retryable_rows() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store.insert_message(&retryable("$a", 10)).expect("a");
+        store.insert_message(&retryable("$b", 20)).expect("b");
+        // Undecryptable, but with nothing to retry with.
+        store
+            .insert_message(&msg("$c", 30, "[encrypted]", false))
+            .expect("c");
+        // Already readable.
+        let mut readable = retryable("$d", 40);
+        readable.decrypted = true;
+        store.insert_message(&readable).expect("d");
+        // Never encrypted.
+        let mut plain = msg("$e", 50, "hello", true);
+        plain.encrypted = false;
+        store.insert_message(&plain).expect("e");
+        // Another room.
+        let mut elsewhere = retryable("$f", 60);
+        elsewhere.room = "!q:example.org".into();
+        store.insert_message(&elsewhere).expect("f");
+
+        let got = store
+            .undecrypted_in_room("!r:example.org", 50)
+            .expect("undecrypted");
+        assert_eq!(
+            got,
+            vec![
+                ("$b".to_string(), "S-$b".to_string(), "C-$b".to_string()),
+                ("$a".to_string(), "S-$a".to_string(), "C-$a".to_string()),
+            ],
+            "newest first, only rows that still carry ciphertext"
+        );
+
+        let limited = store
+            .undecrypted_in_room("!r:example.org", 1)
+            .expect("limited");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0, "$b");
     }
 }

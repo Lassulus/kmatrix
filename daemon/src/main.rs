@@ -34,6 +34,17 @@ const SYNC_TIMEOUT_MS: u32 = 30_000;
 /// One-time keys we try to keep published.
 const OTK_TARGET: u32 = 50;
 
+/// The only key-backup algorithm Matrix defines, and the only one vodozemac's
+/// `pk_encryption` implements.
+const BACKUP_ALGORITHM: &str = "m.megolm_backup.v1.curve25519-aes-sha2";
+/// How many recent messages of a room we try to recover keys for when it is
+/// opened. Bounded on purpose: the backup holds tens of thousands of sessions
+/// and each fetch is a request over a slow radio.
+const BACKUP_RESTORE_WINDOW: u32 = 100;
+/// Rooms to restore eagerly right after the recovery key is accepted, so the
+/// user sees an immediate effect instead of a silent success.
+const BACKUP_EAGER_ROOMS: usize = 3;
+
 pub struct NetState {
     pub crypto: Option<Crypto>,
 }
@@ -197,7 +208,11 @@ fn run() -> Result<()> {
     ipc::serve(&shared, listener);
 
     shared.shutdown();
-    let _ = sync_thread.join();
+    // Do NOT join the sync thread: it is usually parked in a 30 s /sync
+    // long-poll, so joining makes "stop the daemon" look wedged for half a
+    // minute. Every store write is its own transaction and the WAL is
+    // checkpointed each sync, so exiting from under it is safe.
+    drop(sync_thread);
     let _ = std::fs::remove_file(data_dir.join("kmatrix.port"));
     Ok(())
 }
@@ -402,6 +417,8 @@ fn convert_event(
                 encrypted: false,
                 decrypted: true,
                 mine,
+                session_id: None,
+                ciphertext: None,
             }))
         }
         "m.room.encrypted" => {
@@ -445,6 +462,10 @@ fn convert_event(
                 encrypted: true,
                 decrypted,
                 mine,
+                // Keep what a later key recovery needs, and only that: once
+                // decrypted these are stored as NULL again.
+                session_id: if decrypted { None } else { Some(sid.to_string()) },
+                ciphertext: if decrypted { None } else { Some(ct.to_string()) },
             }))
         }
         _ => Ok(None),
@@ -625,4 +646,144 @@ pub fn do_send(sh: &Arc<Shared>, room: &str, body: &str) -> Result<String> {
         c.encrypt(&db, room, &envelope, &session.user_id, &session.device_id)?
     };
     api.send_event(room, "m.room.encrypted", &txn, &enc)
+}
+
+/// Accept the user's key-backup recovery key and remember which backup
+/// version it belongs to. Restoring itself is lazy: see `restore_room`.
+pub fn do_backup_key(sh: &Arc<Shared>, key: &str) -> Result<usize> {
+    let api = sh.api().ok_or_else(|| anyhow!("not logged in"))?;
+    let info = api
+        .backup_version()?
+        .ok_or_else(|| anyhow!("this account has no server-side key backup"))?;
+    if info.algorithm != BACKUP_ALGORITHM {
+        return Err(anyhow!(
+            "unsupported key backup algorithm {} (expected {BACKUP_ALGORITHM})",
+            info.algorithm
+        ));
+    }
+
+    {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        c.set_backup_key(&db, key, &info.public_key)?;
+        db.set_meta("backup_version", &info.version)?;
+    }
+
+    // Upgrade what the user is most likely to look at first, so the effect is
+    // visible immediately rather than only on the next room they open.
+    let rooms = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.list_rooms()?
+    };
+    let mut restored = 0usize;
+    for room in rooms.iter().take(BACKUP_EAGER_ROOMS) {
+        restored += restore_room(sh, &api, &info.version, &room.id)?;
+    }
+    Ok(restored)
+}
+
+/// Pull the room keys needed by this room's undecryptable messages out of the
+/// server-side backup, then re-decrypt them in place.
+///
+/// Deliberately per-session and per-room rather than a bulk
+/// `GET /room_keys/keys`: this account's backup holds ~51k sessions, which
+/// would be tens of MB of RAM and rows on a 474 MB device. Opening a room
+/// fetches only the handful of sessions that room's visible history needs.
+pub fn restore_room(
+    sh: &Arc<Shared>,
+    api: &Arc<Api>,
+    version: &str,
+    room: &str,
+) -> Result<usize> {
+    let pending = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.undecrypted_in_room(room, BACKUP_RESTORE_WINDOW)?
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    // Many messages share one Megolm session; fetch each session once.
+    let mut wanted: Vec<String> = Vec::new();
+    for (_, session_id, _) in &pending {
+        if !wanted.iter().any(|s| s == session_id) {
+            wanted.push(session_id.clone());
+        }
+    }
+
+    let mut imported = 0usize;
+    for session_id in &wanted {
+        let entry = match api.backup_session(version, room, session_id) {
+            Ok(Some(e)) => e,
+            Ok(None) => continue, // not in the backup; nothing to be done
+            Err(e) => {
+                eprintln!("kmatrixd: backup fetch {session_id}: {e:#}");
+                continue;
+            }
+        };
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        match c.import_backup_session(&db, room, session_id, &entry) {
+            Ok(true) => imported += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("kmatrixd: backup import {session_id}: {e:#}"),
+        }
+    }
+    if imported == 0 {
+        return Ok(0);
+    }
+
+    // Retry the messages those sessions unlock.
+    let mut upgraded = 0usize;
+    for (event_id, session_id, ciphertext) in &pending {
+        let plain = {
+            let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+            let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+            c.decrypt(session_id, ciphertext)
+        };
+        let Ok(json) = plain else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+            continue;
+        };
+        let body = v
+            .get("content")
+            .and_then(|c| c.get("body"))
+            .and_then(|b| b.as_str())
+            .unwrap_or_default();
+        if body.is_empty() {
+            continue;
+        }
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.upgrade_message(event_id, body)?;
+        upgraded += 1;
+    }
+    Ok(upgraded)
+}
+
+/// Best-effort key recovery for a room the user just opened.
+///
+/// Never fails the caller: if there is no backup key, no network, or the
+/// backup does not have the session, the room simply renders the placeholders
+/// it already had.
+pub fn try_restore_room(sh: &Arc<Shared>, room: &str) {
+    let has_key = match sh.net.lock() {
+        Ok(g) => g.crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+        Err(_) => return,
+    };
+    if !has_key {
+        return;
+    }
+    let Some(api) = sh.api() else { return };
+    let version = match sh.db.lock() {
+        Ok(db) => db.get_meta("backup_version").ok().flatten(),
+        Err(_) => None,
+    };
+    let Some(version) = version else { return };
+    match restore_room(sh, &api, &version, room) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("kmatrixd: recovered {n} message(s) in {room} from key backup"),
+        Err(e) => eprintln!("kmatrixd: backup restore for {room}: {e:#}"),
+    }
 }

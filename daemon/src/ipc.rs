@@ -203,11 +203,16 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         Request::Hello { .. } => json!({"id": id, "ok": true, "version": CLIENT_VERSION}),
 
         Request::Status => {
+            let backup = match sh.net.lock() {
+                Ok(g) => g.crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+                Err(p) => p.into_inner().crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+            };
             let st = match sh.st.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let mut v = json!({ "id": id, "ok": true, "state": st.state.as_str() });
+            let mut v =
+                json!({ "id": id, "ok": true, "state": st.state.as_str(), "backup": backup });
             if let Some(s) = &st.session {
                 v["user_id"] = json!(s.user_id);
                 v["device_id"] = json!(s.device_id);
@@ -249,6 +254,10 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         }
 
         Request::Messages { room, limit } => {
+            // Opening a room is the moment we know which history the user
+            // actually wants, so it is also the moment to spend requests
+            // recovering exactly those room keys from the backup.
+            crate::try_restore_room(sh, &room);
             let r = sh
                 .db
                 .lock()
@@ -277,6 +286,11 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
             sh.kick();
             json!({"id": id, "ok": true})
         }
+
+        Request::BackupKey { key } => match crate::do_backup_key(sh, &key) {
+            Ok(n) => json!({"id": id, "ok": true, "restored": n}),
+            Err(e) => err(id, e),
+        },
 
         Request::Shutdown => json!({"id": id, "ok": true, "__shutdown": true}),
     }
