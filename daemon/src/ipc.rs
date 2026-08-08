@@ -220,7 +220,8 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
                 Err(p) => p.into_inner(),
             };
             let mut v =
-                json!({ "id": id, "ok": true, "state": st.state.as_str(), "backup": backup });
+                json!({ "id": id, "ok": true, "state": st.state.as_str(), "backup": backup,
+                        "clock_skew_ms": sh.api().map(|a| a.clock_skew_ms()).unwrap_or(0) });
             if let Some(s) = &st.session {
                 v["user_id"] = json!(s.user_id);
                 v["device_id"] = json!(s.device_id);

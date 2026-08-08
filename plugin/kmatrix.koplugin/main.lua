@@ -55,15 +55,30 @@ local function shortSender(user_id)
     return user_id:match("^@([^:]+):") or user_id
 end
 
+-- Milliseconds the device clock runs ahead of real time, as measured by the
+-- daemon against the homeserver's Date header and reported by `status`.
+--
+-- Message timestamps are honest UTC, but `os.date` renders them in the
+-- device's own frame, and e-readers are often set wrong: this Kindle keeps
+-- Berlin time in a clock labelled UTC, which its native UI hides by also
+-- claiming to be in GMT. Rendering raw UTC there reads as two hours stale.
+-- Adding the measured offset puts chat times in the same frame as every
+-- other clock on the device, and does nothing at all once the clock is right.
+local clock_skew_ms = 0
+
+local function localise(ts_ms)
+    return math.floor((ts_ms + clock_skew_ms) / 1000)
+end
+
 local function clockOf(ts_ms)
     if not ts_ms or ts_ms <= 0 then return nil end
-    return datetime.secondsToHour(math.floor(ts_ms / 1000),
+    return datetime.secondsToHour(localise(ts_ms),
         G_reader_settings:isTrue("twelve_hour_clock"))
 end
 
 local function dateTimeOf(ts_ms)
     if not ts_ms or ts_ms <= 0 then return "" end
-    return datetime.secondsToDateTime(math.floor(ts_ms / 1000))
+    return datetime.secondsToDateTime(localise(ts_ms))
 end
 
 local KMatrix = WidgetContainer:extend{
@@ -274,6 +289,8 @@ function KMatrix:refreshStatus(done)
             self.device_id = resp.device_id
             self.homeserver = resp.homeserver
             self.backup = resp.backup
+            -- Rendered timestamps follow the device's clock, however wrong.
+            clock_skew_ms = tonumber(resp.clock_skew_ms) or 0
         end
         self:updateSubtitle()
         if done then done(resp.ok == true) end

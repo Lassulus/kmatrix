@@ -52,6 +52,16 @@ pub struct Api {
     agent: Agent,
     base: String,
     token: Option<String>,
+    /// Device clock minus real time, in milliseconds, as last observed from a
+    /// response `Date` header.
+    ///
+    /// E-readers routinely have no RTC battery and no NTP, and this Kindle in
+    /// particular keeps local time in a clock labelled UTC — its own UI looks
+    /// right only because that error cancels against a `GMT` timezone setting.
+    /// Rendering honest UTC timestamps there looks two hours stale. Measuring
+    /// the offset lets the UI display times in the same frame the user sees
+    /// everywhere else, and collapses to zero on a correctly set device.
+    clock_skew_ms: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +149,7 @@ impl Api {
             agent,
             base,
             token: None,
+            clock_skew_ms: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -207,7 +218,27 @@ impl Api {
         if let Some(since) = since {
             req = req.query("since", since);
         }
-        finish(req.call()?, "sync")
+        let res = req.call()?;
+        self.note_server_time(&res);
+        finish(res, "sync")
+    }
+
+    /// Milliseconds the device clock runs ahead of real time (negative if
+    /// behind). Zero until a response has been seen.
+    pub fn clock_skew_ms(&self) -> i64 {
+        self.clock_skew_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_server_time(&self, res: &Response<Body>) {
+        let Some(date) = res.headers().get("date").and_then(|v| v.to_str().ok()) else {
+            return;
+        };
+        let Some(server_ms) = parse_http_date_ms(date) else {
+            return;
+        };
+        let skew = crate::model::now_ms() as i64 - server_ms;
+        self.clock_skew_ms
+            .store(skew, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn send_event(
@@ -528,6 +559,41 @@ fn finish<T: DeserializeOwned>(mut res: Response<Body>, what: &str) -> Result<T>
     serde_json::from_reader(rdr).with_context(|| format!("{what}: malformed response body"))
 }
 
+
+/// Parse an RFC 7231 IMF-fixdate — `Sun, 06 Nov 1994 08:49:37 GMT` — into
+/// milliseconds since the epoch. This is the only date format a server is
+/// required to emit, and hand-parsing it avoids pulling in a date crate for
+/// one header.
+fn parse_http_date_ms(s: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // "Sun, 06 Nov 1994 08:49:37 GMT"
+    let rest = s.split_once(", ")?.1;
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_name = parts.next()?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month_name)? as i64 + 1;
+
+    let mut hms = time.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let min: i64 = hms.next()?.parse().ok()?;
+    let sec: i64 = hms.next()?.parse().ok()?;
+
+    // Days from civil epoch (Howard Hinnant's algorithm), valid for any date.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(((days * 86_400 + hour * 3_600 + min * 60 + sec) * 1000) as i64)
+}
+
 /// Check the status of a response whose body carries nothing we need.
 fn discard(mut res: Response<Body>, what: &str) -> Result<()> {
     check_status(&mut res, what)
@@ -603,7 +669,7 @@ fn encode_segment(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_segment, normalize_base, truncate};
+    use super::{encode_segment, normalize_base, parse_http_date_ms, truncate};
 
     #[test]
     fn normalizes_all_input_forms() {
@@ -655,6 +721,30 @@ mod tests {
         assert_eq!(encode_segment("a/b"), "a%2Fb");
         // Multi-byte UTF-8 is escaped per byte.
         assert_eq!(encode_segment("é"), "%C3%A9");
+    }
+
+    /// The device this was written for reports a clock two hours ahead of
+    /// real time, so getting this parse right is what keeps chat timestamps
+    /// agreeing with everything else on screen.
+    #[test]
+    fn parses_imf_fixdate() {
+        // Canonical example from RFC 7231.
+        assert_eq!(
+            parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777_000)
+        );
+        // The Unix epoch itself.
+        assert_eq!(
+            parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(0)
+        );
+        // A leap day, to exercise the civil-days arithmetic.
+        assert_eq!(
+            parse_http_date_ms("Mon, 29 Feb 2016 12:00:00 GMT"),
+            Some(1_456_747_200_000)
+        );
+        assert_eq!(parse_http_date_ms("not a date"), None);
+        assert_eq!(parse_http_date_ms("Sun, 06 Xxx 1994 08:49:37 GMT"), None);
     }
 
     #[test]
