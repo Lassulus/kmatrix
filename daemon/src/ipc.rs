@@ -82,13 +82,10 @@ pub fn listen(sh: &Arc<Shared>) -> Result<TcpListener> {
     if let Ok(mut st) = sh.st.lock() {
         st.error = None;
     }
-    // Stash the token for connection auth.
-    if let Ok(db) = sh.db.lock() {
-        db.set_meta("ipc_token", &token)?;
-    }
-    if let Ok(db) = sh.db.lock() {
-        db.set_meta("ipc_port", &port.to_string())?;
-    }
+    // In memory, not in the store: `Store::clear()` runs on login and logout
+    // and would otherwise revoke the token we just wrote to the port file.
+    let _ = sh.ipc_token.set(token);
+    let _ = sh.ipc_port.set(port);
     eprintln!("kmatrixd: listening on 127.0.0.1:{port}");
     Ok(listener)
 }
@@ -147,11 +144,8 @@ fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
         if !authed {
             match &env.cmd {
                 Request::Hello { token } => {
-                    let expected = {
-                        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-                        db.get_meta("ipc_token")?
-                    };
-                    if expected.as_deref() == Some(token.as_str()) {
+                    let expected = sh.ipc_token.get().map(String::as_str);
+                    if expected == Some(token.as_str()) {
                         authed = true;
                         reply(
                             &mut writer,
@@ -182,12 +176,7 @@ fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
         if resp.get("__shutdown").is_some() {
             sh.shutdown();
             // `incoming()` blocks until the next connection, so make one.
-            let port = sh
-                .db
-                .lock()
-                .ok()
-                .and_then(|db| db.get_meta("ipc_port").ok().flatten())
-                .and_then(|p| p.parse::<u16>().ok());
+            let port = sh.ipc_port.get().copied();
             if let Some(port) = port {
                 let _ = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
             }
@@ -290,5 +279,68 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         }
 
         Request::Shutdown => json!({"id": id, "ok": true, "__shutdown": true}),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::State;
+    use crate::{NetState, Shared, Status};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Condvar;
+
+    fn shared(dir: &std::path::Path) -> Arc<Shared> {
+        let store = crate::store::Store::open(&dir.join("s.db")).expect("open store");
+        Arc::new(Shared {
+            db: Mutex::new(store),
+            net: Mutex::new(NetState { crypto: None }),
+            api: Mutex::new(None),
+            st: Mutex::new(Status {
+                state: State::LoggedOut,
+                error: None,
+                session: None,
+            }),
+            bus: Bus::new(),
+            wake: (Mutex::new(false), Condvar::new()),
+            running: AtomicBool::new(true),
+            data_dir: dir.to_path_buf(),
+            ipc_token: std::sync::OnceLock::new(),
+            ipc_port: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Regression: the IPC token used to live in the `meta` table, which
+    /// `Store::clear()` wipes on every login and logout. That silently
+    /// revoked the token already written to the port file, so the running
+    /// client kept working while every reconnect failed with "bad token" —
+    /// on a Kindle, the UI simply went blank after the first suspend.
+    #[test]
+    fn ipc_token_survives_store_clear() {
+        let dir =
+            std::env::temp_dir().join(format!("kmatrix-ipc-test-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sh = shared(&dir);
+
+        let _ = sh.ipc_token.set("secret-token".to_string());
+        let _ = sh.ipc_port.set(4242);
+
+        // What login and logout both do.
+        sh.db.lock().expect("db").clear().expect("clear");
+
+        assert_eq!(sh.ipc_token.get().map(String::as_str), Some("secret-token"));
+        assert_eq!(sh.ipc_port.get().copied(), Some(4242));
+
+        // And it must not be recoverable from the store either way.
+        let leaked = sh
+            .db
+            .lock()
+            .expect("db")
+            .get_meta("ipc_token")
+            .expect("get_meta");
+        assert!(leaked.is_none(), "IPC token must never be persisted");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

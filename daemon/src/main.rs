@@ -53,6 +53,14 @@ pub struct Shared {
     pub wake: (Mutex<bool>, Condvar),
     pub running: AtomicBool,
     pub data_dir: PathBuf,
+    /// IPC listener credentials. Deliberately NOT in the store: `clear()`
+    /// wipes every table on login and logout, which would silently revoke the
+    /// token in the port file and make every later `hello` fail with "bad
+    /// token" — the existing connection keeps working, so it presents as the
+    /// UI going blank only after a reconnect (Kindle suspend/resume).
+    /// They are per-process values and have no business being persisted.
+    pub ipc_token: std::sync::OnceLock<String>,
+    pub ipc_port: std::sync::OnceLock<u16>,
 }
 
 impl Shared {
@@ -149,6 +157,8 @@ fn run() -> Result<()> {
         wake: (Mutex::new(false), Condvar::new()),
         running: AtomicBool::new(true),
         data_dir: data_dir.clone(),
+        ipc_token: std::sync::OnceLock::new(),
+        ipc_port: std::sync::OnceLock::new(),
     });
 
     // Restore an existing login before serving, so the first `status` is honest.
@@ -273,15 +283,11 @@ fn process_sync(
 
     for (room_id, jr) in resp.rooms.join {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        let mut room = db
-            .list_rooms()?
-            .into_iter()
-            .find(|r| r.id == room_id)
-            .unwrap_or_else(|| Room {
-                id: room_id.clone(),
-                name: room_id.clone(),
-                ..Default::default()
-            });
+        let mut room = db.get_room(&room_id)?.unwrap_or_else(|| Room {
+            id: room_id.clone(),
+            name: room_id.clone(),
+            ..Default::default()
+        });
         drop(db);
 
         for ev in &jr.state.events {

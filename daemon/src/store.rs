@@ -213,6 +213,30 @@ impl Store {
         Ok(out)
     }
 
+    /// Fetch one room by id. The sync loop needs this per room in a batch;
+    /// doing it with `list_rooms()` is a full table scan each time, which on
+    /// a 766-room account is ~590k row materializations per full sync.
+    pub fn get_room(&self, id: &str) -> Result<Option<Room>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, encrypted, unread, last_ts, last_preview
+                 FROM room WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Room {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        encrypted: row.get::<_, i64>(2)? != 0,
+                        unread: row.get::<_, i64>(3)?.max(0) as u32,
+                        last_ts: row.get::<_, i64>(4)?.max(0) as u64,
+                        last_preview: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .with_context(|| format!("get room {id}"))
+    }
+
     // ------------------------------------------------------------- messages
 
     /// Idempotent by `event_id`. A re-insert may only *upgrade* a row: when a
