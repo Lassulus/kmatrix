@@ -93,7 +93,9 @@ Restart KOReader. The plugin launches
 
 `scripts/testserver.sh` runs a local `matrix-conduit` on
 `http://127.0.0.1:6167` with open registration and encryption enabled. State
-lives in `${TMPDIR:-/tmp}/kmatrix-testserver`.
+lives in `/tmp/kmatrix-testserver` (override with `KMATRIX_TESTSERVER_DIR`);
+it deliberately does not follow `$TMPDIR`, because `nix develop` sets a fresh
+one per invocation and `start`/`stop` would lose each other.
 
 ```sh
 ./scripts/testserver.sh start
@@ -108,15 +110,28 @@ lives in `${TMPDIR:-/tmp}/kmatrix-testserver`.
 does not.
 
 Point the daemon at `http://127.0.0.1:6167` to exercise login, sync, encrypted
-room creation and message round-trips against it. Registering two accounts and
-logging one of them in from a second client is enough to cover the
-device-key/Olm/Megolm path.
+room creation and message round-trips against it. Running two daemons with
+separate `--data-dir`s and logging in as two accounts covers the whole
+device-key/Olm/Megolm path, including key sharing over `/sendToDevice`.
+
+`scripts/ipctest.lua` drives the plugin's `ipc.lua` against a running daemon
+with the KOReader modules stubbed, so the non-blocking read, partial-line
+buffering and request/response correlation can be checked without a device:
+
+```sh
+mkdir -p /tmp/kt/kmatrix
+./daemon/target/release/kmatrixd --data-dir /tmp/kt/kmatrix &
+luajit scripts/ipctest.lua /tmp/kt
+```
+
+It needs `luasocket` and a `json` module on `LUA_PATH` (`dkjson` works;
+KOReader bundles its own).
 
 ## Layout
 
 ```
 daemon/    kmatrixd, Rust
 plugin/    kmatrix.koplugin, Lua
-scripts/   testserver.sh, package.sh
+scripts/   testserver.sh, package.sh, ipctest.lua
 PROTOCOL.md  daemon <-> plugin IPC contract
 ```
