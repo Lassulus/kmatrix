@@ -265,8 +265,9 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         Request::Messages { room, limit } => {
             // Opening a room is the moment we know which history the user
             // actually wants, so it is also the moment to spend requests
-            // recovering exactly those room keys from the backup.
-            crate::try_restore_room(sh, &room);
+            // recovering exactly that: room keys from the backup, and the
+            // events themselves where no ciphertext was ever stored.
+            crate::repair_room(sh, &room);
             let r = sh
                 .db
                 .lock()

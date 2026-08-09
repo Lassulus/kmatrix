@@ -662,6 +662,25 @@ impl Store {
         Ok(out)
     }
 
+    /// How many recent messages in a room are locked with nothing left to
+    /// retry: stored before the client began retaining ciphertext, so the
+    /// only way to read them is to fetch the original events again.
+    pub fn placeholders_without_ciphertext(&self, room: &str, limit: u32) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1 FROM message
+                     WHERE room = ?1 AND encrypted = 1 AND decrypted = 0
+                       AND ciphertext IS NULL
+                     ORDER BY ts DESC LIMIT ?2)",
+                params![room, limit as i64],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("count stale placeholders for {room}"))?;
+        Ok(n as usize)
+    }
+
     /// Undecryptable messages in a room, newest first, that still carry the
     /// ciphertext needed to retry. Returns `(event_id, session_id, ciphertext)`.
     ///
@@ -1499,6 +1518,50 @@ mod tests {
             .expect("limited");
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].0, "$b");
+    }
+
+    /// The complement of `undecrypted_in_room`: rows a key alone cannot fix,
+    /// because the ciphertext was never kept. Only these justify re-fetching
+    /// a room's history over the radio.
+    #[test]
+    fn placeholder_count_ignores_anything_a_key_could_still_unlock() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .insert_message(&msg("$a", 10, "[encrypted]", false))
+            .expect("a");
+        store
+            .insert_message(&msg("$b", 20, "[encrypted]", false))
+            .expect("b");
+        // Locked, but retryable: a key would do, no refetch needed.
+        store.insert_message(&retryable("$c", 30)).expect("c");
+        // Already readable.
+        let mut readable = msg("$d", 40, "hi", true);
+        readable.encrypted = true;
+        store.insert_message(&readable).expect("d");
+        // Never encrypted.
+        let mut plain = msg("$e", 50, "hello", true);
+        plain.encrypted = false;
+        store.insert_message(&plain).expect("e");
+        // Another room entirely.
+        let mut elsewhere = msg("$f", 60, "[encrypted]", false);
+        elsewhere.room = "!q:example.org".into();
+        store.insert_message(&elsewhere).expect("f");
+
+        assert_eq!(
+            store
+                .placeholders_without_ciphertext("!r:example.org", 50)
+                .expect("count"),
+            2
+        );
+        assert_eq!(
+            store
+                .placeholders_without_ciphertext("!r:example.org", 1)
+                .expect("limited"),
+            1,
+            "the limit bounds the window that is examined"
+        );
     }
 
     /// A room as sync writes it; the pagination columns are never part of it.

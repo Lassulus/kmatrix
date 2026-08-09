@@ -95,6 +95,19 @@ struct JoinedMembersResponse {
     joined: BTreeMap<String, IgnoredAny>,
 }
 
+/// Same endpoint as `JoinedMembersResponse`, but keeping display names.
+#[derive(Deserialize)]
+struct MemberNamesResponse {
+    #[serde(default)]
+    joined: BTreeMap<String, MemberName>,
+}
+
+#[derive(Deserialize)]
+struct MemberName {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct MatrixError {
     errcode: Option<String>,
@@ -195,6 +208,31 @@ impl Api {
             .content_type("application/json")
             .send("{}")?;
         discard(res, "logout")
+    }
+
+    /// Joined members of one room with their display names, for naming rooms
+    /// that have neither a name nor a canonical alias.
+    ///
+    /// The documented route is `m.heroes` from `/sync`, but the server only
+    /// sends a summary when it changes, so rooms stored before the client
+    /// understood heroes would keep their ids forever — and re-running an
+    /// initial sync to collect them is not available: over a large account it
+    /// takes long enough that a reverse proxy answers 504, with or without a
+    /// room filter. One small call per affected room is what is left.
+    ///
+    /// Unlike `joined_members`, this keeps the names, so it costs a string
+    /// per member. Only rooms that need naming are ever asked.
+    pub fn member_names(&self, room: &str) -> Result<BTreeMap<String, Option<String>>> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/rooms/{}/joined_members",
+            encode_segment(room)
+        ));
+        let parsed: MemberNamesResponse = finish(self.get_auth(&url)?.call()?, "member names")?;
+        Ok(parsed
+            .joined
+            .into_iter()
+            .map(|(user_id, m)| (user_id, m.display_name))
+            .collect())
     }
 
     /// Long-poll `/sync`.

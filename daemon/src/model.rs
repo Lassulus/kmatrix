@@ -175,6 +175,8 @@ pub struct JoinedRoom {
     pub state: StateBlock,
     #[serde(default)]
     pub unread_notifications: UnreadNotifications,
+    #[serde(default)]
+    pub summary: RoomSummary,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -203,6 +205,19 @@ pub struct UnreadNotifications {
 pub struct OtkCount {
     #[serde(default)]
     pub signed_curve25519: u32,
+}
+
+/// Room summary. The server sends `m.heroes` precisely so a client can name a
+/// room that has no `m.room.name` or canonical alias — direct messages and
+/// most small rooms. Without it such rooms can only be labelled by their id.
+#[derive(Debug, Deserialize, Default)]
+pub struct RoomSummary {
+    #[serde(rename = "m.heroes", default)]
+    pub heroes: Vec<String>,
+    #[serde(rename = "m.joined_member_count", default)]
+    pub joined_member_count: u32,
+    #[serde(rename = "m.invited_member_count", default)]
+    pub invited_member_count: u32,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -245,6 +260,10 @@ pub struct EventContent {
     pub name: Option<String>,
     #[serde(default)]
     pub alias: Option<String>,
+    // m.room.member — carried only for the handful of members the server
+    // sends under lazy loading, and used to name rooms that have no name.
+    #[serde(default)]
+    pub displayname: Option<String>,
     // m.room.encryption / m.room.encrypted
     #[serde(default)]
     pub algorithm: Option<String>,

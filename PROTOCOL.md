@@ -59,6 +59,18 @@ fetch from the backup for that room's undecryptable history. A bulk
 `GET /room_keys/keys` is deliberately not used; a real account here holds ~51k
 sessions, which would cost tens of MB of RAM and rows on a 474 MB device.
 
+A key is not always enough. Messages stored before the client began retaining
+ciphertext hold nothing to decrypt, so `messages` also re-reads that room's
+newest page from the server when it finds such rows, restoring the ciphertext
+the backup key can then unlock. It is counted over exactly the page re-read,
+so a room repairs itself once and not on every open.
+
+Rooms with no `m.room.name` and no canonical alias — most direct messages —
+are named after their members, from `m.heroes` when the server sends a room
+summary. Rooms stored before that were understood are repaired a batch at a
+time between syncs, one small `joined_members` call each: an initial `/sync`
+would be the documented route and answers 504 over a large account.
+
 ## Events
 
 | event | fields | meaning |

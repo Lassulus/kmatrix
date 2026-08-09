@@ -19,6 +19,7 @@ mod ipc;
 mod model;
 mod store;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -42,9 +43,24 @@ const BACKUP_ALGORITHM: &str = "m.megolm_backup.v1.curve25519-aes-sha2";
 /// opened. Bounded on purpose: the backup holds tens of thousands of sessions
 /// and each fetch is a request over a slow radio.
 const BACKUP_RESTORE_WINDOW: u32 = 100;
+
+/// Events re-fetched when a room is opened and its recent history turns out
+/// to be unreadable placeholders. One page: enough to make the screen the
+/// user is looking at readable, and "Load older messages" walks back further.
+const REPAIR_BACKFILL: u32 = 50;
+
 /// Rooms to restore eagerly right after the recovery key is accepted, so the
 /// user sees an immediate effect instead of a silent success.
 const BACKUP_EAGER_ROOMS: usize = 3;
+
+/// Rooms named per pass. Each costs one small request, and the pass sits
+/// between long-polls, so this trades how fast a large backlog of unnamed
+/// rooms clears against how long syncing is held up.
+const NAME_BATCH: usize = 25;
+
+/// Members listed in a computed room name before the rest become "and N
+/// others". Matches the cap the server applies to `m.heroes`.
+const HERO_CAP: usize = 5;
 
 pub struct NetState {
     pub crypto: Option<Crypto>,
@@ -321,8 +337,89 @@ fn run() -> Result<()> {
 
 // ------------------------------------------------------------------ sync
 
+/// Name a room from its members, per the spec's "Calculating the display name
+/// for a room". Only reached when the room has no `m.room.name` and no
+/// canonical alias, which is the normal state of a direct message.
+fn name_from_heroes(jr: &JoinedRoom) -> Option<String> {
+    let s = &jr.summary;
+    let members = s.joined_member_count + s.invited_member_count;
+    if s.heroes.is_empty() {
+        // A joined room always contains us, so a count of zero means the
+        // server sent no summary at all rather than that the room is empty.
+        // Any other heroless room has members we simply cannot name.
+        return (members == 1).then(|| "Empty room".to_string());
+    }
+    let names: Vec<String> = s.heroes.iter().map(|h| hero_name(jr, h)).collect();
+    Some(compose_name(&names, members))
+}
+
+/// Name a room from the full joined-member list, for rooms the server never
+/// sent a summary for. Same output as the hero path: the first few members,
+/// then a count of everyone else.
+fn name_from_members(me: &str, joined: &BTreeMap<String, Option<String>>) -> Option<String> {
+    let members = joined.len() as u32;
+    let names: Vec<String> = joined
+        .iter()
+        .filter(|(user_id, _)| user_id.as_str() != me)
+        .take(HERO_CAP)
+        .map(|(user_id, display)| match display.as_deref() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => localpart(user_id).to_string(),
+        })
+        .collect();
+    if names.is_empty() {
+        return (members <= 1).then(|| "Empty room".to_string());
+    }
+    Some(compose_name(&names, members))
+}
+
+/// "alice, bob and 4 others" — the listed names, then whoever is left once
+/// they and the logged-in user are accounted for.
+fn compose_name(names: &[String], members: u32) -> String {
+    let others = members.saturating_sub(1).saturating_sub(names.len() as u32);
+    let listed = names.join(", ");
+    match others {
+        0 => listed,
+        1 => format!("{listed} and 1 other"),
+        n => format!("{listed} and {n} others"),
+    }
+}
+
+/// A hero's display name if the server sent their membership — under lazy
+/// loading it does so for anyone who has spoken — else their localpart,
+/// which is still far more use than a room id.
+fn hero_name(jr: &JoinedRoom, user_id: &str) -> String {
+    let member = jr
+        .state
+        .events
+        .iter()
+        .chain(jr.timeline.events.iter())
+        .find(|ev| ev.kind == "m.room.member" && ev.state_key.as_deref() == Some(user_id));
+    if let Some(name) = member.and_then(|ev| ev.content.displayname.as_deref()) {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    localpart(user_id).to_string()
+}
+
+/// `@alice:example.com` -> `alice`. Still far more use than a room id, and it
+/// fits an e-reader's room list where the full id does not.
+fn localpart(user_id: &str) -> &str {
+    let user_id = user_id.strip_prefix('@').unwrap_or(user_id);
+    user_id.split(':').next().unwrap_or(user_id)
+}
+
 fn sync_loop(sh: Arc<Shared>) {
     let mut backoff = 1u64;
+    // Recorded in the store, so the repair sync happens once per install and
+    // not on every launch.
+    let mut names_done = sh
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.get_meta("room_names_backfilled").ok().flatten())
+        .is_some();
     while sh.running.load(Ordering::SeqCst) {
         let (api, session) = (sh.api(), sh.session());
         let (api, session) = match (api, session) {
@@ -332,6 +429,22 @@ fn sync_loop(sh: Arc<Shared>) {
                 continue;
             }
         };
+
+        // Between polls, not after one: this needs nothing from the sync, and
+        // a long-poll can sit idle for its full 30 s window before returning.
+        if !names_done {
+            match backfill_room_names(&sh, &api, &session.user_id) {
+                Ok((0, _)) => names_done = true,
+                Ok((n, done)) => {
+                    names_done = done;
+                    eprintln!("kmatrixd: named {n} room(s) after their members");
+                }
+                Err(e) => {
+                    names_done = true;
+                    eprintln!("kmatrixd: room naming: {e:#}");
+                }
+            }
+        }
 
         match sync_once(&sh, &api, &session) {
             Ok(()) => {
@@ -460,6 +573,14 @@ fn process_sync(
                 _ => {}
             }
         }
+
+        // A room with neither a name nor an alias — most direct messages —
+        // is named after its members, not left labelled by its id.
+        if room.name == room.id {
+            if let Some(n) = name_from_heroes(&jr) {
+                room.name = n;
+            }
+        }
         room.unread = jr.unread_notifications.notification_count;
 
         let mut msgs = Vec::new();
@@ -532,6 +653,66 @@ fn process_sync(
             .publish(&serde_json::json!({ "event": "rooms", "rooms": rooms }));
     }
     Ok(())
+}
+
+/// Give a batch of rooms still labelled by their id a real name.
+///
+/// Summaries only arrive when they change, so rooms already synced before the
+/// client understood `m.heroes` would keep their ids forever, and an initial
+/// sync to collect them 504s on a large account. So each affected room is
+/// asked about directly — a handful per pass, between long-polls, until none
+/// are left and the run is recorded in `meta`.
+///
+/// Returns the number renamed and whether the work is finished.
+fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(usize, bool)> {
+    let unnamed: Vec<String> = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.list_rooms()?
+            .into_iter()
+            .filter(|r| r.name == r.id)
+            .map(|r| r.id)
+            .take(NAME_BATCH)
+            .collect()
+    };
+    if unnamed.is_empty() {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.set_meta("room_names_backfilled", "1")?;
+        return Ok((0, true));
+    }
+
+    let mut renamed = 0usize;
+    for room_id in &unnamed {
+        // A room we cannot reach stays under its id; the pass must still make
+        // progress on the rest, and every room is retried on a later launch.
+        let members = match api.member_names(room_id) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("kmatrixd: naming {room_id}: {e:#}");
+                continue;
+            }
+        };
+        let Some(name) = name_from_members(me, &members) else {
+            continue;
+        };
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let Some(mut room) = db.get_room(room_id)? else {
+            continue;
+        };
+        room.name = name;
+        db.upsert_room(&room)?;
+        renamed += 1;
+    }
+
+    if renamed > 0 {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let rooms = db.list_rooms()?;
+        drop(db);
+        sh.bus
+            .publish(&serde_json::json!({ "event": "rooms", "rooms": rooms }));
+    }
+    // Nothing renamed from a full batch means the rest cannot be named at
+    // all; stop rather than ask again after every sync.
+    Ok((renamed, renamed == 0))
 }
 
 /// Turn a timeline event into a `Message`, decrypting when needed.
@@ -932,6 +1113,62 @@ pub fn try_restore_room(sh: &Arc<Shared>, room: &str) {
     }
 }
 
+/// Make a room as readable as it can be, at the moment it is opened.
+///
+/// Two different things lock a message. One is a missing room key, which the
+/// backup can supply. The other is older: messages stored before the client
+/// kept the ciphertext have nothing left to decrypt, and no key will bring
+/// them back — only re-fetching the original events will. So when the recent
+/// history is full of those, page it in once and try the backup again.
+pub fn repair_room(sh: &Arc<Shared>, room: &str) {
+    try_restore_room(sh, room);
+
+    // Counted over exactly the page about to be re-read: a wider window would
+    // keep triggering re-reads of a page that never contained the stale rows.
+    let stale = match sh.db.lock() {
+        Ok(db) => db
+            .placeholders_without_ciphertext(room, REPAIR_BACKFILL)
+            .unwrap_or(0),
+        Err(_) => return,
+    };
+    if stale == 0 {
+        return;
+    }
+    match refetch_recent(sh, room, REPAIR_BACKFILL) {
+        Ok(0) => return,
+        Ok(n) => eprintln!("kmatrixd: re-read {n} event(s) in {room} to unlock history"),
+        Err(e) => {
+            eprintln!("kmatrixd: re-reading {room}: {e:#}");
+            return;
+        }
+    }
+    try_restore_room(sh, room);
+}
+
+/// Re-fetch the newest page of a room's history, overwriting what we hold.
+///
+/// `/sync` delivered these events once already, but rows written before the
+/// client kept ciphertext have nothing a key can act on; asking the server
+/// for the same events again restores exactly what was discarded.
+///
+/// Deliberately independent of `back_token`: that token walks backwards from
+/// the oldest event we hold, which is the one direction that never revisits
+/// the messages on screen.
+fn refetch_recent(sh: &Arc<Shared>, room: &str, limit: u32) -> Result<usize> {
+    let api = sh.api().ok_or_else(|| anyhow!("not logged in"))?;
+    let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
+    let page = api.messages(room, None, limit)?;
+    let mut stored = 0usize;
+    for ev in &page.chunk {
+        if let Some(m) = convert_event(sh, room, ev, &session)? {
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            db.insert_message(&m)?;
+            stored += 1;
+        }
+    }
+    Ok(stored)
+}
+
 // ----------------------------------------------------------- verification
 
 /// Push a `VerifyStep` out: send its to-device events, tell the UI.
@@ -1216,4 +1453,106 @@ pub fn do_load_older(sh: &Arc<Shared>, room: &str, limit: u32) -> Result<(usize,
         }));
     }
     Ok((stored, exhausted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined(json: &str) -> JoinedRoom {
+        serde_json::from_str(json).expect("joined room")
+    }
+
+    #[test]
+    fn prefers_a_heros_display_name_over_their_id() {
+        let jr = joined(
+            r#"{"summary":{"m.heroes":["@alice:example.com"],"m.joined_member_count":2},
+                "state":{"events":[{"type":"m.room.member","state_key":"@alice:example.com",
+                                    "content":{"displayname":"Alice"}}]}}"#,
+        );
+        assert_eq!(name_from_heroes(&jr).as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn falls_back_to_the_localpart_when_no_membership_was_sent() {
+        let jr = joined(
+            r#"{"summary":{"m.heroes":["@alice:example.com","@bob:example.com"],
+                           "m.joined_member_count":3}}"#,
+        );
+        assert_eq!(name_from_heroes(&jr).as_deref(), Some("alice, bob"));
+    }
+
+    #[test]
+    fn counts_the_members_the_five_hero_cap_leaves_out() {
+        let jr = joined(
+            r#"{"summary":{"m.heroes":["@a:h","@b:h","@c:h","@d:h","@e:h"],
+                           "m.joined_member_count":9,"m.invited_member_count":1}}"#,
+        );
+        // 9 + 1 members, minus ourselves, minus the five named.
+        assert_eq!(
+            name_from_heroes(&jr).as_deref(),
+            Some("a, b, c, d, e and 4 others")
+        );
+    }
+
+    #[test]
+    fn a_single_remaining_member_is_not_pluralised() {
+        let jr = joined(
+            r#"{"summary":{"m.heroes":["@a:h"],"m.joined_member_count":3}}"#,
+        );
+        assert_eq!(name_from_heroes(&jr).as_deref(), Some("a and 1 other"));
+    }
+
+    #[test]
+    fn names_a_room_everyone_else_has_left() {
+        let jr = joined(r#"{"summary":{"m.heroes":[],"m.joined_member_count":1}}"#);
+        assert_eq!(name_from_heroes(&jr).as_deref(), Some("Empty room"));
+    }
+
+    #[test]
+    fn declines_to_invent_a_name_without_heroes() {
+        // A populated room that sent no heroes tells us nothing; the caller
+        // must keep the room id rather than mislabel the room.
+        let jr = joined(r#"{"summary":{"m.heroes":[],"m.joined_member_count":40}}"#);
+        assert_eq!(name_from_heroes(&jr), None);
+        assert_eq!(name_from_heroes(&joined("{}")), None);
+    }
+
+    fn members(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(u, d)| (u.to_string(), d.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn names_a_room_after_everyone_but_us() {
+        let m = members(&[
+            ("@me:h", Some("Me")),
+            ("@alice:h", Some("Alice")),
+            ("@bob:h", None),
+        ]);
+        // Display name where the server has one, localpart where it does not.
+        assert_eq!(name_from_members("@me:h", &m).as_deref(), Some("Alice, bob"));
+    }
+
+    #[test]
+    fn a_room_containing_only_us_is_empty() {
+        let m = members(&[("@me:h", Some("Me"))]);
+        assert_eq!(name_from_members("@me:h", &m).as_deref(), Some("Empty room"));
+    }
+
+    #[test]
+    fn a_crowd_is_capped_and_counted() {
+        let mut pairs: Vec<(String, Option<String>)> = (0..12)
+            .map(|i| (format!("@u{i:02}:h"), None))
+            .collect();
+        pairs.push(("@me:h".to_string(), None));
+        let m: BTreeMap<_, _> = pairs.into_iter().collect();
+        // Five named, thirteen members, ourselves excluded: seven left.
+        assert_eq!(
+            name_from_members("@me:h", &m).as_deref(),
+            Some("u00, u01, u02, u03, u04 and 7 others")
+        );
+    }
 }
