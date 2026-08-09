@@ -308,6 +308,21 @@ impl Api {
         Ok(parsed.name.filter(|n| !n.is_empty()))
     }
 
+    /// One event by id, as the server still holds it.
+    ///
+    /// Used to recover the ciphertext of a message stored before the client
+    /// kept any. Paging the room's recent history is cheaper per event but
+    /// only reaches as far back as its window, and the messages that need
+    /// this are the oldest ones — the ones a window never reaches.
+    pub fn event(&self, room: &str, event_id: &str) -> Result<RoomEvent> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/rooms/{}/event/{}",
+            encode_segment(room),
+            encode_segment(event_id)
+        ));
+        finish(self.get_auth(&url)?.call()?, "event")
+    }
+
     /// Long-poll `/sync`.
     ///
     /// The response is deserialized directly from the socket. Do NOT replace

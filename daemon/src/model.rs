@@ -51,7 +51,9 @@ pub struct Message {
     /// is `@signal_<uuid>`, a WhatsApp one a phone number — so without this
     /// every message in a bridged room is attributed to an opaque id.
     /// Filled when reading; never written back.
-    #[serde(default)]
+    /// Omitted rather than sent as `null`: the plugin's JSON decoder maps a
+    /// null to a truthy sentinel, so an absent name must be an absent field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
     pub body: String,
     pub encrypted: bool,

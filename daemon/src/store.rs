@@ -919,6 +919,30 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Which messages are locked with nothing left to retry, newest first.
+    ///
+    /// The counterpart of `placeholders_without_ciphertext`: the ids to ask
+    /// the server for, so the ciphertext they were stored without comes back.
+    pub fn placeholder_event_ids(&self, room: &str, limit: u32) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT event_id FROM message
+                 WHERE room = ?1 AND encrypted = 1 AND decrypted = 0
+                   AND ciphertext IS NULL
+                 ORDER BY ts DESC LIMIT ?2",
+            )
+            .context("prepare placeholder id query")?;
+        let rows = stmt
+            .query_map(params![room, limit as i64], |row| row.get::<_, String>(0))
+            .with_context(|| format!("query placeholders in {room}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("read placeholder id")?);
+        }
+        Ok(out)
+    }
+
     // -------------------------------------------------------------- pickles
 
     pub fn put_pickle(&self, kind: &str, id: &str, extra: &str, pickle: &str) -> Result<()> {

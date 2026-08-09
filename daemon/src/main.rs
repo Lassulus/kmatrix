@@ -44,10 +44,10 @@ const BACKUP_ALGORITHM: &str = "m.megolm_backup.v1.curve25519-aes-sha2";
 /// and each fetch is a request over a slow radio.
 const BACKUP_RESTORE_WINDOW: u32 = 100;
 
-/// Events re-fetched when a room is opened and its recent history turns out
-/// to be unreadable placeholders. One page: enough to make the screen the
-/// user is looking at readable, and "Load older messages" walks back further.
-const REPAIR_BACKFILL: u32 = 50;
+/// Placeholder events re-fetched per room open. Each costs one small request
+/// and permanently fixes that message, so a room with a long locked history
+/// clears over a few visits rather than in one burst.
+const REPAIR_EVENTS: u32 = 25;
 
 /// Rooms to restore eagerly right after the recovery key is accepted, so the
 /// user sees an immediate effect instead of a silent success.
@@ -1361,22 +1361,11 @@ pub fn repair_room(sh: &Arc<Shared>, room: &str) {
     try_restore_room(sh, room);
     name_visible_senders(sh, room);
 
-    // Counted over exactly the page about to be re-read: a wider window would
-    // keep triggering re-reads of a page that never contained the stale rows.
-    let stale = match sh.db.lock() {
-        Ok(db) => db
-            .placeholders_without_ciphertext(room, REPAIR_BACKFILL)
-            .unwrap_or(0),
-        Err(_) => return,
-    };
-    if stale == 0 {
-        return;
-    }
-    match refetch_recent(sh, room, REPAIR_BACKFILL) {
+    match refetch_placeholders(sh, room) {
         Ok(0) => return,
-        Ok(n) => eprintln!("kmatrixd: re-read {n} event(s) in {room} to unlock history"),
+        Ok(n) => eprintln!("kmatrixd: refetched {n} event(s) in {room} to unlock history"),
         Err(e) => {
-            eprintln!("kmatrixd: re-reading {room}: {e:#}");
+            eprintln!("kmatrixd: refetching in {room}: {e:#}");
             return;
         }
     }
@@ -1394,7 +1383,7 @@ fn name_visible_senders(sh: &Arc<Shared>, room: &str) {
     let Some(api) = sh.api() else { return };
     let unknown: Vec<String> = {
         let Ok(db) = sh.db.lock() else { return };
-        let Ok(msgs) = db.recent_messages(room, REPAIR_BACKFILL) else {
+        let Ok(msgs) = db.recent_messages(room, BACKUP_RESTORE_WINDOW) else {
             return;
         };
         let mut seen: Vec<String> = Vec::new();
@@ -1432,22 +1421,36 @@ fn name_visible_senders(sh: &Arc<Shared>, room: &str) {
     }
 }
 
-/// Re-fetch the newest page of a room's history, overwriting what we hold.
+/// Ask the server again for the messages we hold without their ciphertext.
 ///
-/// `/sync` delivered these events once already, but rows written before the
-/// client kept ciphertext have nothing a key can act on; asking the server
-/// for the same events again restores exactly what was discarded.
-///
-/// Deliberately independent of `back_token`: that token walks backwards from
-/// the oldest event we hold, which is the one direction that never revisits
-/// the messages on screen.
-fn refetch_recent(sh: &Arc<Shared>, room: &str, limit: u32) -> Result<usize> {
+/// Stored before the client kept any, they have nothing a room key can act
+/// on. Re-reading the room's newest page is one request rather than many,
+/// but it only reaches as far back as that page — and these are the oldest
+/// messages in the room, so a page never reaches them and the same page gets
+/// re-read on every open. Asking for each event by id costs a request each
+/// and ends: once an event is back, it is no longer a placeholder.
+fn refetch_placeholders(sh: &Arc<Shared>, room: &str) -> Result<usize> {
+    let wanted = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.placeholder_event_ids(room, REPAIR_EVENTS)?
+    };
+    if wanted.is_empty() {
+        return Ok(0);
+    }
     let api = sh.api().ok_or_else(|| anyhow!("not logged in"))?;
     let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
-    let page = api.messages(room, None, limit)?;
     let mut stored = 0usize;
-    for ev in &page.chunk {
-        if let Some(m) = convert_event(sh, room, ev, &session)? {
+    for event_id in &wanted {
+        // A redacted or purged event is simply gone; the placeholder stays
+        // and the rest of the batch still gets its chance.
+        let ev = match api.event(room, event_id) {
+            Ok(ev) => ev,
+            Err(e) => {
+                eprintln!("kmatrixd: refetching {event_id}: {e:#}");
+                continue;
+            }
+        };
+        if let Some(m) = convert_event(sh, room, &ev, &session)? {
             let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
             db.insert_message(&m)?;
             stored += 1;
@@ -1818,6 +1821,39 @@ mod tests {
 
     fn nobody() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+
+    /// The plugin's JSON decoder renders a null as a truthy sentinel, so
+    /// `msg.sender_name or fallback` yields the sentinel and the next
+    /// concatenation throws — taking the whole timeline with it. An absent
+    /// name must therefore be an absent field, not a null one.
+    #[test]
+    fn an_unknown_sender_name_is_left_out_rather_than_sent_as_null() {
+        let m = Message {
+            event_id: "$e".into(),
+            room: "!r:h".into(),
+            sender: "@a:h".into(),
+            ts: 1,
+            sender_name: None,
+            body: "hi".into(),
+            encrypted: false,
+            decrypted: true,
+            mine: false,
+            session_id: None,
+            ciphertext: None,
+        };
+        let json = serde_json::to_string(&m).expect("serialise");
+        assert!(
+            !json.contains("sender_name"),
+            "an unknown name must not reach the plugin at all: {json}"
+        );
+
+        let named = Message {
+            sender_name: Some("Oliver Habryka (S)".into()),
+            ..m
+        };
+        let json = serde_json::to_string(&named).expect("serialise");
+        assert!(json.contains(r#""sender_name":"Oliver Habryka (S)""#), "{json}");
     }
 
     #[test]

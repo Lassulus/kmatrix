@@ -55,6 +55,15 @@ local function shortSender(user_id)
     return user_id:match("^@([^:]+):") or user_id
 end
 
+--- A field the daemon may omit, as a string or nil.
+--
+-- The JSON decoder renders a null as a truthy sentinel rather than nil, so
+-- `resp.field or fallback` silently yields the sentinel and the next
+-- concatenation throws. Anything that is not a string did not arrive.
+local function str(value)
+    return type(value) == "string" and value or nil
+end
+
 -- Milliseconds the device clock runs ahead of real time, as measured by the
 -- daemon against the homeserver's Date header and reported by `status`.
 --
@@ -787,7 +796,7 @@ function KMatrix:messageItems()
         -- The display name where the room knows one: a bridged contact's
         -- localpart is a Signal uuid or a bare phone number.
         local sender = message.mine and _("Me")
-            or message.sender_name
+            or str(message.sender_name)
             or shortSender(message.sender)
         local body = message.body or ""
         if message.encrypted and not message.decrypted then
@@ -930,14 +939,14 @@ function KMatrix:appendMessages(messages, keep_page)
                 added = true
             elseif stored.body ~= message.body
                 or stored.decrypted ~= message.decrypted
-                or stored.sender_name ~= message.sender_name then
+                or str(stored.sender_name) ~= str(message.sender_name) then
                 -- Text and attribution only: an edit keeps the original
                 -- event's place in the room's history, so the timestamp the
                 -- row sorts and displays by stays the one it was first sent
                 -- at. A sender can gain a name after we look their profile up.
                 stored.body = message.body
                 stored.decrypted = message.decrypted
-                stored.sender_name = message.sender_name
+                stored.sender_name = str(message.sender_name)
                 updated = true
             end
         end
