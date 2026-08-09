@@ -109,6 +109,12 @@ struct MemberName {
 }
 
 #[derive(Deserialize)]
+struct DisplayNameResponse {
+    #[serde(default)]
+    displayname: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MatrixError {
     errcode: Option<String>,
     error: Option<String>,
@@ -235,6 +241,47 @@ impl Api {
             .collect())
     }
 
+    /// The account's `m.direct`: which user each direct-message room is with.
+    ///
+    /// Needed because a bridged DM cannot be named from its member list. A
+    /// Signal portal holds the contact's ghost, *our own* ghost — a different
+    /// user id from ours, so it survives every "not me" filter — and the
+    /// bridge bot, which is how a private chat ends up displayed as
+    /// "me, them, Signal Bridge Bot". `m.direct` names the counterpart
+    /// outright. An account that has never had a DM answers 404, which is
+    /// an empty map rather than an error.
+    pub fn direct_rooms(&self, user_id: &str) -> Result<BTreeMap<String, Vec<String>>> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/user/{}/account_data/m.direct",
+            encode_segment(user_id)
+        ));
+        let res = self.get_auth(&url)?.call()?;
+        if res.status().as_u16() == 404 {
+            return Ok(BTreeMap::new());
+        }
+        finish(res, "m.direct")
+    }
+
+    /// One user's display name, globally rather than per room.
+    ///
+    /// Used for the handful of senders visible in a room whose name we never
+    /// learned. The per-room answer would be `joined_members`, but that pulls
+    /// the entire membership — tens of thousands of names for a large public
+    /// room, to identify the four people on screen. A profile lookup is a few
+    /// bytes. Users without a display name answer 404.
+    pub fn profile_name(&self, user_id: &str) -> Result<Option<String>> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/profile/{}/displayname",
+            encode_segment(user_id)
+        ));
+        let res = self.get_auth(&url)?.call()?;
+        if res.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let parsed: DisplayNameResponse = finish(res, "profile displayname")?;
+        Ok(parsed.displayname.filter(|n| !n.is_empty()))
+    }
+
     /// Long-poll `/sync`.
     ///
     /// The response is deserialized directly from the socket. Do NOT replace
@@ -264,7 +311,8 @@ impl Api {
     /// Milliseconds the device clock runs ahead of real time (negative if
     /// behind). Zero until a response has been seen.
     pub fn clock_skew_ms(&self) -> i64 {
-        self.clock_skew_ms.load(std::sync::atomic::Ordering::Relaxed)
+        self.clock_skew_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn note_server_time(&self, res: &Response<Body>) {
@@ -597,7 +645,6 @@ fn finish<T: DeserializeOwned>(mut res: Response<Body>, what: &str) -> Result<T>
     serde_json::from_reader(rdr).with_context(|| format!("{what}: malformed response body"))
 }
 
-
 /// Parse an RFC 7231 IMF-fixdate — `Sun, 06 Nov 1994 08:49:37 GMT` — into
 /// milliseconds since the epoch. This is the only date format a server is
 /// required to emit, and hand-parsing it avoids pulling in a date crate for
@@ -772,10 +819,7 @@ mod tests {
             Some(784_111_777_000)
         );
         // The Unix epoch itself.
-        assert_eq!(
-            parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT"),
-            Some(0)
-        );
+        assert_eq!(parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         // A leap day, to exercise the civil-days arithmetic.
         assert_eq!(
             parse_http_date_ms("Mon, 29 Feb 2016 12:00:00 GMT"),

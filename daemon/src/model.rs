@@ -46,6 +46,13 @@ pub struct Message {
     pub room: String,
     pub sender: String,
     pub ts: u64,
+    /// The sender's display name in this room, when we know it. Bridged
+    /// contacts have no readable localpart to fall back on — a Signal ghost
+    /// is `@signal_<uuid>`, a WhatsApp one a phone number — so without this
+    /// every message in a bridged room is attributed to an opaque id.
+    /// Filled when reading; never written back.
+    #[serde(default)]
+    pub sender_name: Option<String>,
     pub body: String,
     pub encrypted: bool,
     pub decrypted: bool,
@@ -275,9 +282,33 @@ pub struct EventContent {
     pub session_id: Option<String>,
     #[serde(default)]
     pub device_id: Option<String>,
-    // m.room.member (membership only; display name and avatar are skipped)
+    // m.room.member (membership only; avatars are skipped)
     #[serde(default)]
     pub membership: Option<String>,
+    // An edit: the replacement text, and which event it replaces. The
+    // top-level `body` of such an event is the "* new text" fallback for
+    // clients that cannot apply edits, which is exactly what we must not show.
+    #[serde(rename = "m.new_content", default)]
+    pub new_content: Option<Box<EventContent>>,
+    #[serde(rename = "m.relates_to", default)]
+    pub relates_to: Option<Relation>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Relation {
+    #[serde(default)]
+    pub rel_type: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+/// The plaintext inside an `m.room.encrypted` event. Only the content is of
+/// any use: the envelope repeats a room and sender the outer event already
+/// gave us, and the outer ones are what the server vouches for.
+#[derive(Debug, Deserialize, Default)]
+pub struct DecryptedEvent {
+    #[serde(default)]
+    pub content: EventContent,
 }
 
 #[derive(Debug, Deserialize, Default)]

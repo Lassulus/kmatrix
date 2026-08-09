@@ -213,14 +213,17 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         Request::Status => {
             let backup = match sh.net.lock() {
                 Ok(g) => g.crypto.as_ref().is_some_and(|c| c.has_backup_key()),
-                Err(p) => p.into_inner().crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+                Err(p) => p
+                    .into_inner()
+                    .crypto
+                    .as_ref()
+                    .is_some_and(|c| c.has_backup_key()),
             };
             let st = match sh.st.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let mut v =
-                json!({ "id": id, "ok": true, "state": st.state.as_str(), "backup": backup,
+            let mut v = json!({ "id": id, "ok": true, "state": st.state.as_str(), "backup": backup,
                         "clock_skew_ms": sh.api().map(|a| a.clock_skew_ms()).unwrap_or(0) });
             if let Some(s) = &st.session {
                 v["user_id"] = json!(s.user_id);
@@ -297,7 +300,6 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
             json!({"id": id, "ok": true})
         }
 
-
         Request::LoadOlder { room, limit } => match crate::do_load_older(sh, &room, limit) {
             Ok((added, exhausted)) => {
                 json!({"id": id, "ok": true, "added": added, "exhausted": exhausted})
@@ -320,7 +322,6 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
         Request::Shutdown => json!({"id": id, "ok": true, "__shutdown": true}),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

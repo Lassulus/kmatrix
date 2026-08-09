@@ -784,7 +784,11 @@ function KMatrix:messageItems()
     end
     for i = 1, #timeline.messages do
         local message = timeline.messages[i]
-        local sender = message.mine and _("Me") or shortSender(message.sender)
+        -- The display name where the room knows one: a bridged contact's
+        -- localpart is a Signal uuid or a bare phone number.
+        local sender = message.mine and _("Me")
+            or message.sender_name
+            or shortSender(message.sender)
         local body = message.body or ""
         if message.encrypted and not message.decrypted then
             body = "\u{f023} " .. body -- 'lock' sign: could not be decrypted
@@ -907,22 +911,43 @@ function KMatrix:loadOlderMessages()
     end)
 end
 
---- Adds messages we have not seen yet (the daemon may resend on overlap).
+--- Adds messages we have not seen yet, and rewrites the ones we have whose
+-- text moved on: the daemon resends an event under its own id after another
+-- client edited it, and after a backfill decrypts what was a locked
+-- placeholder. Both must change the row where it stands.
 function KMatrix:appendMessages(messages, keep_page)
     local timeline = self.timeline
     if not timeline then return end
-    local added = false
+    local added, updated = false, false
     for i = 1, #messages do
         local message = messages[i]
         local key = message.event_id
-        if key and not timeline.seen[key] then
-            timeline.seen[key] = true
-            table.insert(timeline.messages, message)
-            added = true
+        if key then
+            local stored = timeline.seen[key]
+            if not stored then
+                timeline.seen[key] = message
+                table.insert(timeline.messages, message)
+                added = true
+            elseif stored.body ~= message.body
+                or stored.decrypted ~= message.decrypted
+                or stored.sender_name ~= message.sender_name then
+                -- Text and attribution only: an edit keeps the original
+                -- event's place in the room's history, so the timestamp the
+                -- row sorts and displays by stays the one it was first sent
+                -- at. A sender can gain a name after we look their profile up.
+                stored.body = message.body
+                stored.decrypted = message.decrypted
+                stored.sender_name = message.sender_name
+                updated = true
+            end
         end
     end
-    if not added then return end
-    self:refreshTimeline(keep_page)
+    -- Every sync arrives here, almost always with nothing new; a repaint costs
+    -- an e-ink refresh, so an unchanged resend must fall out silently.
+    if not (added or updated) then return end
+    -- Only a new message may pull the view down to the newest page. A rewrite
+    -- happens under the reader, who did not ask to be moved.
+    self:refreshTimeline(keep_page or not added)
     self:markRead()
 end
 

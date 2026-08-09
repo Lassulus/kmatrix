@@ -19,9 +19,10 @@
 //! shell on the device, which can read the key file just as easily as the
 //! database. Anyone extending this should not mistake it for more.
 //!
-//! Encrypted: message bodies, room names and previews, the retained Megolm
-//! ciphertext, and the `session`, `backup_key` and `pickle_key` entries of
-//! `meta` -- the access token and both long-term secrets.
+//! Encrypted: message bodies, pending edit bodies, room names and previews,
+//! member display names, the retained Megolm ciphertext, and the `session`,
+//! `backup_key` and `pickle_key` entries of `meta` -- the access token and
+//! both long-term secrets.
 //!
 //! Deliberately **not** encrypted, and you should know this before trusting
 //! the file: event ids, room ids, senders, timestamps, and the `pickle`
@@ -60,6 +61,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 use vodozemac::hazmat::{Cipher, Mac};
@@ -107,6 +109,33 @@ CREATE TABLE IF NOT EXISTS pickle (
     extra  TEXT NOT NULL,
     pickle TEXT NOT NULL,
     PRIMARY KEY (kind, id)
+);
+-- One pending edit per message, holding the newest replacement text seen for
+-- it. Kept as a table of its own rather than folded into `message` because an
+-- edit routinely arrives for an event the store does not have yet: history is
+-- paged backwards on demand, so the original usually turns up long after the
+-- edit that replaced it. `body` is the same plaintext a message body is and
+-- carries the same encryption, so the stored value is copied straight into
+-- `message.body` when the edit is applied, never unsealed on the way.
+CREATE TABLE IF NOT EXISTS edit (
+    target TEXT PRIMARY KEY,
+    ts     INTEGER NOT NULL,
+    body   TEXT NOT NULL
+);
+-- What a room calls each of its members. The `sender` on a message is an
+-- MXID, and for a bridged contact that id is machine-generated -- a Signal
+-- ghost is `@signal_<uuid>`, a WhatsApp one a bare phone number -- so the
+-- localpart the UI would otherwise show names nobody. Keyed by room as well
+-- as user because a display name is per-room state in Matrix: the same
+-- account can be `Mum` in one room and `@signal_...` in another that never
+-- sent a member event for it. `name` is personal data of the same kind as
+-- `room.name` and carries the same encryption; `room` and `user_id` are
+-- metadata and stay legible, as senders and room ids already do.
+CREATE TABLE IF NOT EXISTS member (
+    room    TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    PRIMARY KEY (room, user_id)
 );
 ";
 
@@ -363,6 +392,8 @@ impl Store {
                  DELETE FROM meta;
                  DELETE FROM room;
                  DELETE FROM message;
+                 DELETE FROM edit;
+                 DELETE FROM member;
                  DELETE FROM pickle;
                  COMMIT;",
             )
@@ -585,6 +616,11 @@ impl Store {
     /// room key arrives late, the same event is written again with the plain
     /// body and `decrypted = 1`, replacing the placeholder in place.
     ///
+    /// A recorded edit outranks the incoming body, which is why the body goes
+    /// in through a `COALESCE` over the `edit` table. Paging history backwards
+    /// hands us the edit long before the event it replaces, and without this
+    /// the original text would win simply by arriving second.
+    ///
     /// `ciphertext` is encrypted along with `body`. It is Megolm ciphertext,
     /// so it is not readable plaintext to begin with -- but it is readable to
     /// anyone who later gets the room key, which is exactly what the key
@@ -600,7 +636,9 @@ impl Store {
                 "INSERT INTO message
                      (event_id, room, sender, ts, body, encrypted, decrypted, mine,
                       session_id, ciphertext)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4,
+                         COALESCE((SELECT body FROM edit WHERE target = ?1), ?5),
+                         ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(event_id) DO UPDATE SET
                      body       = excluded.body,
                      decrypted  = excluded.decrypted,
@@ -625,14 +663,25 @@ impl Store {
 
     /// The newest `limit` messages of `room`, returned oldest-first so the UI
     /// can append them in reading order.
+    ///
+    /// Each row carries the sender's display name in this room, when one has
+    /// been remembered. The join is a left outer one on purpose: a message
+    /// whose sender no member event has ever named must still come back, just
+    /// without a name.
     pub fn recent_messages(&self, room: &str, limit: u32) -> Result<Vec<Message>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT event_id, room, sender, ts, body, encrypted, decrypted, mine,
-                        session_id, ciphertext
-                 FROM message WHERE room = ?1
-                 ORDER BY ts DESC, event_id DESC LIMIT ?2",
+                "SELECT message.event_id, message.room, message.sender, message.ts,
+                        message.body, message.encrypted, message.decrypted,
+                        message.mine, message.session_id, message.ciphertext,
+                        member.name
+                 FROM message
+                 LEFT JOIN member
+                     ON member.room = message.room
+                    AND member.user_id = message.sender
+                 WHERE message.room = ?1
+                 ORDER BY message.ts DESC, message.event_id DESC LIMIT ?2",
             )
             .context("prepare message query")?;
         let rows = stmt
@@ -642,6 +691,7 @@ impl Store {
                     room: row.get(1)?,
                     sender: row.get(2)?,
                     ts: row.get::<_, i64>(3)?.max(0) as u64,
+                    sender_name: row.get(10)?,
                     body: row.get(4)?,
                     encrypted: row.get::<_, i64>(5)? != 0,
                     decrypted: row.get::<_, i64>(6)? != 0,
@@ -655,6 +705,7 @@ impl Store {
         for m in rows {
             let mut m = m.context("read message row")?;
             m.body = self.reveal("message.body", m.body)?;
+            m.sender_name = self.reveal_opt("member.name", m.sender_name.take())?;
             m.ciphertext = self.reveal_opt("message.ciphertext", m.ciphertext.take())?;
             out.push(m);
         }
@@ -720,6 +771,10 @@ impl Store {
     /// recovered from the backup: replace the placeholder body in place and drop
     /// the retained ciphertext, which has done its job.
     ///
+    /// A recorded edit still outranks the recovered text: the edit replaced
+    /// this very event, so whatever the room key finally decrypted is the
+    /// superseded version of it.
+    ///
     /// A row that is no longer there is not an error; the backlog may have been
     /// trimmed between listing the retries and finishing them.
     pub fn upgrade_message(&self, event_id: &str, body: &str) -> Result<()> {
@@ -727,12 +782,106 @@ impl Store {
         self.conn
             .execute(
                 "UPDATE message
-                 SET body = ?2, decrypted = 1, session_id = NULL, ciphertext = NULL
+                 SET body = COALESCE((SELECT body FROM edit WHERE target = ?1), ?2),
+                     decrypted = 1, session_id = NULL, ciphertext = NULL
                  WHERE event_id = ?1",
                 params![event_id, body.as_ref()],
             )
             .with_context(|| format!("upgrade message {event_id}"))?;
         Ok(())
+    }
+
+    /// Record an edit of `target` and apply it if that message is stored.
+    /// Newest `ts` wins. Returns whether a stored message was changed.
+    ///
+    /// The edit is kept even when the target is unknown, which is the common
+    /// case: rooms are paged backwards on demand, so the event being replaced
+    /// is usually still further back in the history than we have walked.
+    /// [`Store::insert_message`] applies the edit when the original lands.
+    ///
+    /// Only the newest edit per message is kept -- earlier ones are never
+    /// displayed -- so an older edit paged in after a newer one changes
+    /// nothing and returns `false`. Equal timestamps go to the later arrival;
+    /// the spec breaks that tie on event id, which this table does not keep,
+    /// and it decides only between two edits made in the same millisecond.
+    pub fn record_edit(&self, target: &str, ts: u64, body: &str) -> Result<bool> {
+        // One sealed value for both cells: they hold the same plaintext by
+        // construction, and sealing twice would only spend a second salt on
+        // hiding an equality the schema already implies.
+        let stored = self.protect(body);
+        // Both writes land together or neither does. An edit row without the
+        // message body it implies would leave the superseded text on screen
+        // until that event is written again, which for a message already in
+        // the backlog never happens.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .with_context(|| format!("begin edit of {target}"))?;
+        let recorded = tx
+            .execute(
+                "INSERT INTO edit (target, ts, body) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(target) DO UPDATE SET
+                     ts   = excluded.ts,
+                     body = excluded.body
+                 WHERE excluded.ts >= edit.ts",
+                params![target, ts as i64, stored.as_ref()],
+            )
+            .with_context(|| format!("record edit of {target}"))?;
+        if recorded == 0 {
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE message SET body = ?2 WHERE event_id = ?1",
+                params![target, stored.as_ref()],
+            )
+            .with_context(|| format!("apply edit of {target}"))?;
+        tx.commit()
+            .with_context(|| format!("commit edit of {target}"))?;
+        Ok(changed > 0)
+    }
+
+    // -------------------------------------------------------------- members
+
+    /// Remember what a room calls its members.
+    ///
+    /// A `None` or empty name is the absence of information rather than a
+    /// name: the member event carried no `displayname`. Writing it would
+    /// throw away a name we already have and put the raw MXID back on screen,
+    /// so such entries are skipped.
+    ///
+    /// One transaction for the whole map because the caller hands over a
+    /// room's members in a batch -- a sync round, the naming sweep, opening a
+    /// room -- and a commit per member would cost the device a WAL write per
+    /// person in the room.
+    pub fn remember_members(
+        &self,
+        room: &str,
+        names: &BTreeMap<String, Option<String>>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .with_context(|| format!("begin member update for {room}"))?;
+        {
+            let mut upsert = tx
+                .prepare_cached(
+                    "INSERT INTO member (room, user_id, name) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(room, user_id) DO UPDATE SET name = excluded.name",
+                )
+                .context("prepare member upsert")?;
+            for (user_id, name) in names {
+                let Some(name) = name.as_deref().filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                let stored = self.protect(name);
+                upsert
+                    .execute(params![room, user_id, stored.as_ref()])
+                    .with_context(|| format!("remember member {user_id} of {room}"))?;
+            }
+        }
+        tx.commit()
+            .with_context(|| format!("commit member update for {room}"))
     }
 
     // -------------------------------------------------------------- pickles
@@ -768,9 +917,11 @@ impl Store {
     }
 }
 
-/// Bring an existing database up to the current schema. `CREATE TABLE IF NOT
-/// EXISTS` leaves an already-present table exactly as it was, so columns added
-/// after a release have to be bolted on by hand — a device holding thousands of
+/// Bring an existing database up to the current schema. A whole new table
+/// needs nothing here: [`SCHEMA`] runs on every open, and `CREATE TABLE IF NOT
+/// EXISTS` adds it to an existing database in place. That same clause leaves an
+/// already-present table exactly as it was, though, so columns added after a
+/// release have to be bolted on by hand — a device holding thousands of
 /// messages cannot afford to have the table dropped and rebuilt.
 fn migrate(conn: &Connection) -> Result<()> {
     // (table, column, declaration). Grouped by table so each one is inspected
@@ -946,6 +1097,78 @@ fn encrypt_existing(conn: &mut Connection, master: &[u8; 32]) -> Result<()> {
         }
     }
 
+    // Pending edits are one row per edited message, a handful even on a busy
+    // account, and `body` is a message body under a different name.
+    let edits: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT target, body FROM edit")
+            .context("prepare edit encryption scan")?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("scan edits for encryption")?;
+        let mut edits = Vec::new();
+        for e in mapped {
+            edits.push(e.context("read edit row for encryption")?);
+        }
+        edits
+    };
+    {
+        let mut update = tx
+            .prepare("UPDATE edit SET body = ?2 WHERE target = ?1")
+            .context("prepare edit encryption update")?;
+        for (target, body) in edits {
+            if body.starts_with(ENC_PREFIX) {
+                continue;
+            }
+            update
+                .execute(params![target, seal(master, &body)])
+                .with_context(|| format!("encrypt edit of {target}"))?;
+        }
+    }
+
+    // One row per person per room, so this table can outgrow the room table by
+    // a wide margin on an account with a few large rooms. Walked in the same
+    // bounded chunks as the message table rather than materialized whole.
+    {
+        let mut after: i64 = 0;
+        let mut batch: Vec<(i64, String)> = Vec::with_capacity(CHUNK);
+        loop {
+            batch.clear();
+            {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "SELECT rowid, name FROM member
+                         WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                    )
+                    .context("prepare member encryption scan")?;
+                let mapped = stmt
+                    .query_map(params![after, CHUNK as i64], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .context("scan members for encryption")?;
+                for m in mapped {
+                    batch.push(m.context("read member row for encryption")?);
+                }
+            }
+            let Some((last, _)) = batch.last() else {
+                break;
+            };
+            after = *last;
+
+            let mut update = tx
+                .prepare_cached("UPDATE member SET name = ?2 WHERE rowid = ?1")
+                .context("prepare member encryption update")?;
+            for (rowid, name) in batch.drain(..) {
+                if name.starts_with(ENC_PREFIX) {
+                    continue;
+                }
+                update
+                    .execute(params![rowid, seal(master, &name)])
+                    .with_context(|| format!("encrypt member rowid {rowid}"))?;
+            }
+        }
+    }
+
     mark_encrypted(&tx)?;
     tx.commit().context("commit store encryption")?;
     Ok(())
@@ -1051,6 +1274,7 @@ mod tests {
             room: "!r:example.org".into(),
             sender: "@alice:example.org".into(),
             ts,
+            sender_name: None,
             body: body.into(),
             encrypted: true,
             decrypted,
@@ -1477,6 +1701,542 @@ mod tests {
             .expect("upgrade missing row");
     }
 
+    /// The body of one message of `room`, by event id, as the UI would read it.
+    fn body_of(store: &Store, event_id: &str) -> String {
+        let rows = store.recent_messages("!r:example.org", 50).expect("recent");
+        match rows.iter().find(|m| m.event_id == event_id) {
+            Some(m) => m.body.clone(),
+            None => panic!("message {event_id} is not in the store"),
+        }
+    }
+
+    #[test]
+    fn an_edit_replaces_the_body_of_the_message_it_targets() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .insert_message(&msg("$orig", 10, "frist post", true))
+            .expect("insert");
+        store
+            .insert_message(&msg("$other", 20, "untouched", true))
+            .expect("insert");
+
+        assert!(
+            store
+                .record_edit("$orig", 30, "first post")
+                .expect("record edit"),
+            "editing a stored message must report that it changed"
+        );
+
+        // Replaced in place: one row, with the new text, at the original
+        // position in the timeline.
+        let rows = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(
+            rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            vec!["first post", "untouched"],
+            "an edit must rewrite the original rather than adding a message"
+        );
+        assert_eq!(rows[0].ts, 10, "the edit must not move the message");
+
+        // An edit of something we do not have is recorded, not applied.
+        assert!(
+            !store
+                .record_edit("$absent", 40, "for a message we never saw")
+                .expect("record edit"),
+            "there was no stored message to change"
+        );
+    }
+
+    #[test]
+    fn an_edit_recorded_before_its_target_is_applied_on_insert() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        // The order backwards pagination produces: the edit is in the live
+        // timeline, the message it replaces is pages back in the history.
+        assert!(!store
+            .record_edit("$orig", 30, "first post")
+            .expect("record edit"));
+        store
+            .insert_message(&msg("$orig", 10, "frist post", true))
+            .expect("insert");
+
+        assert_eq!(body_of(&store, "$orig"), "first post");
+
+        // And a later rewrite of the same event -- a re-fetch, or the same
+        // event seen again in another sync -- must not bring the old text back.
+        store
+            .insert_message(&msg("$orig", 10, "frist post", true))
+            .expect("re-insert");
+        assert_eq!(body_of(&store, "$orig"), "first post");
+    }
+
+    #[test]
+    fn only_the_newest_edit_of_a_message_counts() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .insert_message(&msg("$orig", 10, "take one", true))
+            .expect("insert");
+
+        assert!(store.record_edit("$orig", 30, "take two").expect("edit"));
+        assert!(store.record_edit("$orig", 40, "take three").expect("edit"));
+        assert_eq!(body_of(&store, "$orig"), "take three");
+
+        // Paging history backwards can hand us the superseded edit after the
+        // newest one. It must change nothing.
+        assert!(
+            !store.record_edit("$orig", 30, "take two").expect("edit"),
+            "an older edit must report that it changed nothing"
+        );
+        assert_eq!(body_of(&store, "$orig"), "take three");
+
+        // Including on a later rewrite of the target, which reads the edit
+        // table rather than remembering what it applied.
+        store
+            .insert_message(&msg("$orig", 10, "take one", true))
+            .expect("re-insert");
+        assert_eq!(body_of(&store, "$orig"), "take three");
+    }
+
+    #[test]
+    fn an_edit_outlives_a_decryption_upgrade() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        // The edit arrives while the event it replaces is still unreadable,
+        // and the room key turns up afterwards.
+        store
+            .insert_message(&retryable("$evt", 10))
+            .expect("insert");
+        assert!(store
+            .record_edit("$evt", 30, "the edited text")
+            .expect("record edit"));
+        store
+            .upgrade_message("$evt", "the superseded original")
+            .expect("upgrade");
+
+        assert_eq!(
+            body_of(&store, "$evt"),
+            "the edited text",
+            "the decrypted original must not clobber the edit that replaced it"
+        );
+        // The upgrade still did its other half.
+        assert!(store
+            .undecrypted_in_room("!r:example.org", 50)
+            .expect("undecrypted")
+            .is_empty());
+    }
+
+    #[test]
+    fn clear_forgets_recorded_edits() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .insert_message(&msg("$orig", 10, "frist post", true))
+            .expect("insert");
+        store
+            .record_edit("$orig", 30, "first post")
+            .expect("record edit");
+
+        store.clear().expect("clear");
+
+        // A cleared store must not resurrect the edit text onto a message
+        // written after the wipe -- logout leaves no message contents behind.
+        store
+            .insert_message(&msg("$orig", 10, "frist post", true))
+            .expect("insert after clear");
+        assert_eq!(body_of(&store, "$orig"), "frist post");
+    }
+
+    #[test]
+    fn the_edit_table_is_added_to_an_existing_database() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create db directory");
+        }
+
+        // A database as written by a build that predates edits at all.
+        {
+            let conn = Connection::open(&path).expect("open raw connection");
+            conn.execute_batch(
+                "CREATE TABLE message (
+                     event_id   TEXT PRIMARY KEY,
+                     room       TEXT NOT NULL,
+                     sender     TEXT NOT NULL,
+                     ts         INTEGER NOT NULL,
+                     body       TEXT NOT NULL,
+                     encrypted  INTEGER NOT NULL,
+                     decrypted  INTEGER NOT NULL,
+                     mine       INTEGER NOT NULL,
+                     session_id TEXT,
+                     ciphertext TEXT
+                 );
+                 INSERT INTO message (event_id, room, sender, ts, body,
+                                      encrypted, decrypted, mine)
+                 VALUES ('$old', '!r:example.org', '@alice:example.org', 5,
+                         'frist post', 1, 1, 0);",
+            )
+            .expect("create pre-edit schema");
+        }
+
+        // Opening creates the table in place, leaving the backlog alone.
+        {
+            let store = tmp.open();
+            assert!(store
+                .record_edit("$old", 30, "first post")
+                .expect("record edit"));
+            assert_eq!(body_of(&store, "$old"), "first post");
+        }
+
+        // Idempotent: a second open finds the table and its row intact.
+        let store = tmp.open();
+        assert_eq!(body_of(&store, "$old"), "first post");
+        assert!(
+            !store.record_edit("$old", 20, "stale").expect("record edit"),
+            "the recorded edit survived the reopen, so the older one loses"
+        );
+    }
+
+    #[test]
+    fn edit_bodies_never_reach_the_disk_in_the_clear() {
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+        const EDITED: &str = "the replacement text, which is a message body";
+
+        store
+            .insert_message(&msg("$e1", 10, "the original text", true))
+            .expect("insert");
+        store.record_edit("$e1", 30, EDITED).expect("record edit");
+        // Recorded against a message that is not here yet: the row sits in the
+        // edit table on its own, which is where it would leak from.
+        store.record_edit("$e2", 40, EDITED).expect("record edit");
+
+        assert_eq!(body_of(&store, "$e1"), EDITED);
+
+        let raw = tmp.raw();
+        assert_sealed(&raw_body(&raw, "$e1"), EDITED, "edited message.body");
+        for target in ["$e1", "$e2"] {
+            assert_sealed(
+                &raw_cell(&raw, "SELECT body FROM edit WHERE target = ?1", target),
+                EDITED,
+                "edit.body",
+            );
+        }
+        // Timestamps are metadata and stay legible, like every other ts here.
+        assert_eq!(
+            raw_cell(
+                &raw,
+                "SELECT CAST(ts AS TEXT) FROM edit WHERE target = ?1",
+                "$e1"
+            ),
+            "30"
+        );
+    }
+
+    #[test]
+    fn opening_with_a_key_seals_a_legacy_edit_body() {
+        let tmp = TempDb::new();
+        const EDITED: &str = "an edit written before the store had a key";
+
+        {
+            let store = tmp.open();
+            store
+                .insert_message(&msg("$orig", 10, "frist post", true))
+                .expect("insert");
+            store.record_edit("$orig", 30, EDITED).expect("record edit");
+            assert_eq!(
+                raw_cell(
+                    &tmp.raw(),
+                    "SELECT body FROM edit WHERE target = ?1",
+                    "$orig"
+                ),
+                EDITED,
+                "an unencrypted store stores the edit as it is"
+            );
+        }
+
+        let store = tmp.keyed();
+        assert_eq!(body_of(&store, "$orig"), EDITED);
+
+        let raw = tmp.raw();
+        assert_sealed(
+            &raw_cell(&raw, "SELECT body FROM edit WHERE target = ?1", "$orig"),
+            EDITED,
+            "migrated edit.body",
+        );
+
+        // Reopening leaves it byte-identical; re-sealing would draw a new salt.
+        let before = snapshot(&raw);
+        drop(store);
+        let store = tmp.keyed();
+        assert_eq!(
+            snapshot(&tmp.raw()),
+            before,
+            "a second open re-encrypted an edit that was already encrypted"
+        );
+        assert_eq!(body_of(&store, "$orig"), EDITED);
+    }
+
+    /// A room's members as a sync round hands them over: an id apiece, and a
+    /// display name only where the member event carried one.
+    fn members(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(id, name)| ((*id).to_string(), name.map(str::to_string)))
+            .collect()
+    }
+
+    /// The display name one message of `room` is attributed to, as the UI
+    /// would read it.
+    fn name_of(store: &Store, room: &str, event_id: &str) -> Option<String> {
+        let rows = store.recent_messages(room, 50).expect("recent");
+        match rows.iter().find(|m| m.event_id == event_id) {
+            Some(m) => m.sender_name.clone(),
+            None => panic!("message {event_id} is not in {room}"),
+        }
+    }
+
+    /// One message from `sender`, in `room`.
+    fn msg_from(event_id: &str, room: &str, sender: &str, ts: u64) -> Message {
+        let mut m = msg(event_id, ts, "hello", true);
+        m.room = room.into();
+        m.sender = sender.into();
+        m
+    }
+
+    /// The complaint this table exists for: a Signal ghost's MXID names
+    /// nobody, and the display name is the only readable thing about it.
+    #[test]
+    fn a_remembered_name_is_attached_to_that_senders_messages() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+        const GHOST: &str = "@signal_040dfb49-edd5-45e4-8cfa-7215665abc1d:example.org";
+
+        store
+            .remember_members("!r:example.org", &members(&[(GHOST, Some("Grandma"))]))
+            .expect("remember");
+        store
+            .insert_message(&msg_from("$1", "!r:example.org", GHOST, 10))
+            .expect("insert named");
+        // Nobody has told us what this room calls Alice.
+        store
+            .insert_message(&msg("$2", 20, "hi", true))
+            .expect("insert unnamed");
+
+        assert_eq!(
+            name_of(&store, "!r:example.org", "$1").as_deref(),
+            Some("Grandma")
+        );
+        assert_eq!(name_of(&store, "!r:example.org", "$2"), None);
+    }
+
+    #[test]
+    fn a_display_name_belongs_to_one_room_not_to_the_account() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .remember_members(
+                "!here:example.org",
+                &members(&[("@alice:example.org", Some("Alice"))]),
+            )
+            .expect("remember here");
+        store
+            .remember_members(
+                "!there:example.org",
+                &members(&[("@alice:example.org", Some("alice (admin)"))]),
+            )
+            .expect("remember there");
+
+        store
+            .insert_message(&msg_from(
+                "$1",
+                "!here:example.org",
+                "@alice:example.org",
+                10,
+            ))
+            .expect("insert here");
+        store
+            .insert_message(&msg_from(
+                "$2",
+                "!there:example.org",
+                "@alice:example.org",
+                20,
+            ))
+            .expect("insert there");
+
+        assert_eq!(
+            name_of(&store, "!here:example.org", "$1").as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            name_of(&store, "!there:example.org", "$2").as_deref(),
+            Some("alice (admin)")
+        );
+    }
+
+    #[test]
+    fn a_nameless_member_event_does_not_erase_a_name_we_have() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .remember_members(
+                "!r:example.org",
+                &members(&[("@alice:example.org", Some("Alice"))]),
+            )
+            .expect("remember");
+        store
+            .insert_message(&msg("$1", 10, "hi", true))
+            .expect("insert");
+
+        // A lazily-loaded member event with no `displayname`, and one with an
+        // empty string: both say nothing, so both must leave the name alone.
+        for absent in [None, Some("")] {
+            store
+                .remember_members(
+                    "!r:example.org",
+                    &members(&[("@alice:example.org", absent)]),
+                )
+                .expect("remember nameless");
+            assert_eq!(
+                name_of(&store, "!r:example.org", "$1").as_deref(),
+                Some("Alice"),
+                "a member event without a name overwrote one we already knew"
+            );
+        }
+    }
+
+    #[test]
+    fn member_names_never_reach_the_disk_in_the_clear() {
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+        const NAME: &str = "Grandma, who is on Signal";
+
+        store
+            .remember_members(
+                "!r:example.org",
+                &members(&[("@alice:example.org", Some(NAME))]),
+            )
+            .expect("remember");
+        store
+            .insert_message(&msg("$1", 10, "hi", true))
+            .expect("insert");
+        assert_eq!(
+            name_of(&store, "!r:example.org", "$1").as_deref(),
+            Some(NAME)
+        );
+
+        let raw = tmp.raw();
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT name FROM member WHERE user_id = ?1",
+                "@alice:example.org",
+            ),
+            NAME,
+            "member.name",
+        );
+        // The MXID is metadata, like every other sender in this file.
+        assert_eq!(
+            raw_cell(
+                &raw,
+                "SELECT user_id FROM member WHERE user_id = ?1",
+                "@alice:example.org"
+            ),
+            "@alice:example.org"
+        );
+    }
+
+    #[test]
+    fn clear_forgets_member_names() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+
+        store
+            .remember_members(
+                "!r:example.org",
+                &members(&[("@alice:example.org", Some("Alice"))]),
+            )
+            .expect("remember");
+        store
+            .insert_message(&msg("$1", 10, "hi", true))
+            .expect("insert");
+
+        store.clear().expect("clear");
+
+        // A display name is personal data and must not outlive the session:
+        // a message written after the wipe is back to a bare MXID.
+        store
+            .insert_message(&msg("$1", 10, "hi", true))
+            .expect("insert after clear");
+        assert_eq!(name_of(&store, "!r:example.org", "$1"), None);
+    }
+
+    #[test]
+    fn opening_with_a_key_seals_a_legacy_member_name() {
+        let tmp = TempDb::new();
+        const NAME: &str = "a name written before the store had a key";
+
+        {
+            let store = tmp.open();
+            store
+                .remember_members(
+                    "!r:example.org",
+                    &members(&[("@alice:example.org", Some(NAME))]),
+                )
+                .expect("remember");
+            assert_eq!(
+                raw_cell(
+                    &tmp.raw(),
+                    "SELECT name FROM member WHERE user_id = ?1",
+                    "@alice:example.org"
+                ),
+                NAME,
+                "an unencrypted store stores the name as it is"
+            );
+        }
+
+        let store = tmp.keyed();
+        store
+            .insert_message(&msg("$1", 10, "hi", true))
+            .expect("insert");
+        assert_eq!(
+            name_of(&store, "!r:example.org", "$1").as_deref(),
+            Some(NAME)
+        );
+
+        let raw = tmp.raw();
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT name FROM member WHERE user_id = ?1",
+                "@alice:example.org",
+            ),
+            NAME,
+            "migrated member.name",
+        );
+
+        // Reopening leaves it byte-identical; re-sealing would draw a new salt.
+        let before = snapshot(&raw);
+        drop(store);
+        let store = tmp.keyed();
+        assert_eq!(
+            snapshot(&tmp.raw()),
+            before,
+            "a second open re-encrypted a member name that was already encrypted"
+        );
+        assert_eq!(
+            name_of(&store, "!r:example.org", "$1").as_deref(),
+            Some(NAME)
+        );
+    }
+
     #[test]
     fn undecrypted_in_room_only_returns_retryable_rows() {
         let tmp = TempDb::new();
@@ -1759,11 +2519,14 @@ mod tests {
     /// Every value-bearing cell of every table encryption touches, exactly as
     /// stored. Used to prove an operation left the database alone.
     fn snapshot(conn: &Connection) -> Vec<String> {
-        const QUERIES: [&str; 3] = [
+        const QUERIES: [&str; 5] = [
             "SELECT k || '=' || v FROM meta ORDER BY k",
             "SELECT id || '=' || name || '/' || last_preview FROM room ORDER BY id",
             "SELECT event_id || '=' || body || '/' || COALESCE(ciphertext, '')
              FROM message ORDER BY event_id",
+            "SELECT room || '/' || user_id || '=' || name FROM member
+             ORDER BY room, user_id",
+            "SELECT target || '=' || body FROM edit ORDER BY target",
         ];
         let mut out = Vec::new();
         for sql in QUERIES {

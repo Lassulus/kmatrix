@@ -53,10 +53,18 @@ const REPAIR_BACKFILL: u32 = 50;
 /// user sees an immediate effect instead of a silent success.
 const BACKUP_EAGER_ROOMS: usize = 3;
 
-/// Rooms named per pass. Each costs one small request, and the pass sits
-/// between long-polls, so this trades how fast a large backlog of unnamed
-/// rooms clears against how long syncing is held up.
+/// Rooms visited per naming pass. Each may cost one small request, and the
+/// pass sits between long-polls, so this trades how fast the sweep clears
+/// against how long syncing is held up.
 const NAME_BATCH: usize = 25;
+
+/// Bumped whenever the naming rules change, so the sweep runs again over
+/// rooms it has already seen and corrects names derived under the old rules.
+const NAME_SCHEMA: &str = "2";
+
+/// Sender profiles looked up when a room is opened. Bounded so opening a
+/// room with a long unnamed cast costs a few small requests, not hundreds.
+const SENDER_LOOKUPS: usize = 8;
 
 /// Members listed in a computed room name before the rest become "and N
 /// others". Matches the cap the server applies to `m.heroes`.
@@ -412,14 +420,14 @@ fn localpart(user_id: &str) -> &str {
 
 fn sync_loop(sh: Arc<Shared>) {
     let mut backoff = 1u64;
-    // Recorded in the store, so the repair sync happens once per install and
-    // not on every launch.
+    // The sweep is recorded in the store, so it runs once per schema version
+    // rather than on every launch.
     let mut names_done = sh
         .db
         .lock()
         .ok()
-        .and_then(|db| db.get_meta("room_names_backfilled").ok().flatten())
-        .is_some();
+        .and_then(|db| db.get_meta("room_names_schema").ok().flatten())
+        .is_some_and(|v| v == NAME_SCHEMA);
     while sh.running.load(Ordering::SeqCst) {
         let (api, session) = (sh.api(), sh.session());
         let (api, session) = match (api, session) {
@@ -434,10 +442,11 @@ fn sync_loop(sh: Arc<Shared>) {
         // a long-poll can sit idle for its full 30 s window before returning.
         if !names_done {
             match backfill_room_names(&sh, &api, &session.user_id) {
-                Ok((0, _)) => names_done = true,
                 Ok((n, done)) => {
                     names_done = done;
-                    eprintln!("kmatrixd: named {n} room(s) after their members");
+                    if n > 0 {
+                        eprintln!("kmatrixd: named {n} room(s)");
+                    }
                 }
                 Err(e) => {
                     names_done = true;
@@ -574,6 +583,24 @@ fn process_sync(
             }
         }
 
+        // Lazy loading sends the membership of anyone who speaks in the batch,
+        // which is exactly whose name the timeline is about to need.
+        let names: BTreeMap<String, Option<String>> = jr
+            .state
+            .events
+            .iter()
+            .chain(jr.timeline.events.iter())
+            .filter(|ev| ev.kind == "m.room.member")
+            .filter_map(|ev| {
+                let user = ev.state_key.clone()?;
+                Some((user, ev.content.displayname.clone()))
+            })
+            .collect();
+        if !names.is_empty() {
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            db.remember_members(&room_id, &names)?;
+        }
+
         // A room with neither a name nor an alias — most direct messages —
         // is named after its members, not left labelled by its id.
         if room.name == room.id {
@@ -655,54 +682,95 @@ fn process_sync(
     Ok(())
 }
 
-/// Give a batch of rooms still labelled by their id a real name.
+/// Name a batch of rooms, sweeping the whole list once per schema version.
 ///
-/// Summaries only arrive when they change, so rooms already synced before the
-/// client understood `m.heroes` would keep their ids forever, and an initial
-/// sync to collect them 504s on a large account. So each affected room is
-/// asked about directly — a handful per pass, between long-polls, until none
-/// are left and the run is recorded in `meta`.
+/// Two things need fixing that `/sync` will not tell us. Rooms stored before
+/// the client understood `m.heroes` keep their ids, and an initial sync to
+/// collect every summary 504s on a large account. And a direct chat cannot be
+/// named from its members at all when it is bridged: a Signal portal holds
+/// the contact's ghost, our own ghost, and the bridge bot, so the member list
+/// reads "me, them, Signal Bridge Bot". `m.direct` says who the chat is with.
 ///
-/// Returns the number renamed and whether the work is finished.
+/// The sweep walks rooms in id order, `NAME_BATCH` per pass, recording how far
+/// it got. Rooms needing nothing cost no request at all.
+///
+/// Returns the number renamed and whether the sweep has reached the end.
 fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(usize, bool)> {
-    let unnamed: Vec<String> = {
-        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        db.list_rooms()?
-            .into_iter()
-            .filter(|r| r.name == r.id)
-            .map(|r| r.id)
-            .take(NAME_BATCH)
-            .collect()
-    };
-    if unnamed.is_empty() {
-        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        db.set_meta("room_names_backfilled", "1")?;
-        return Ok((0, true));
+    let direct = api.direct_rooms(me).unwrap_or_default();
+    let mut counterpart: BTreeMap<&str, &str> = BTreeMap::new();
+    for (user, rooms) in &direct {
+        for room in rooms {
+            counterpart.entry(room.as_str()).or_insert(user.as_str());
+        }
     }
 
+    let (batch, done) = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let cursor = db.get_meta("room_names_cursor")?.unwrap_or_default();
+        let mut rooms: Vec<Room> = db
+            .list_rooms()?
+            .into_iter()
+            .filter(|r| r.id > cursor)
+            .collect();
+        rooms.sort_by(|a, b| a.id.cmp(&b.id));
+        let done = rooms.len() <= NAME_BATCH;
+        rooms.truncate(NAME_BATCH);
+        (rooms, done)
+    };
+
     let mut renamed = 0usize;
-    for room_id in &unnamed {
-        // A room we cannot reach stays under its id; the pass must still make
-        // progress on the rest, and every room is retried on a later launch.
-        let members = match api.member_names(room_id) {
+    let mut reached = None;
+    for room in &batch {
+        reached = Some(room.id.clone());
+        let partner = counterpart.get(room.id.as_str()).copied();
+        // Nothing to learn about a room that is already named and is not a
+        // direct chat, so it costs no request.
+        if room.name != room.id && partner.is_none() {
+            continue;
+        }
+        let members = match api.member_names(&room.id) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("kmatrixd: naming {room_id}: {e:#}");
+                eprintln!("kmatrixd: naming {}: {e:#}", room.id);
                 continue;
             }
         };
-        let Some(name) = name_from_members(me, &members) else {
-            continue;
+        {
+            // Already paid for over the radio; keeping the names spares every
+            // message in this room from being attributed to a bare id.
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            db.remember_members(&room.id, &members)?;
+        }
+        let from_members = name_from_members(me, &members);
+        let wanted = match partner {
+            Some(user) => Some(person_name(user, &members)),
+            None => from_members.clone(),
         };
+        let Some(wanted) = wanted else { continue };
+        // Only ever replace a name we derived ourselves. Anything else came
+        // from `m.room.name` or a canonical alias and the server means it.
+        let ours = room.name == room.id || Some(&room.name) == from_members.as_ref();
+        if !ours || room.name == wanted {
+            continue;
+        }
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        let Some(mut room) = db.get_room(room_id)? else {
+        let Some(mut stored) = db.get_room(&room.id)? else {
             continue;
         };
-        room.name = name;
-        db.upsert_room(&room)?;
+        stored.name = wanted;
+        db.upsert_room(&stored)?;
         renamed += 1;
     }
 
+    {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        if let Some(reached) = reached {
+            db.set_meta("room_names_cursor", &reached)?;
+        }
+        if done {
+            db.set_meta("room_names_schema", NAME_SCHEMA)?;
+        }
+    }
     if renamed > 0 {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         let rooms = db.list_rooms()?;
@@ -710,9 +778,50 @@ fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(us
         sh.bus
             .publish(&serde_json::json!({ "event": "rooms", "rooms": rooms }));
     }
-    // Nothing renamed from a full batch means the rest cannot be named at
-    // all; stop rather than ask again after every sync.
-    Ok((renamed, renamed == 0))
+    Ok((renamed, done))
+}
+
+/// One person's name as this room knows them, else their localpart.
+fn person_name(user_id: &str, members: &BTreeMap<String, Option<String>>) -> String {
+    match members.get(user_id).and_then(|d| d.as_deref()) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => localpart(user_id).to_string(),
+    }
+}
+
+/// Record a replacement if this content is one, and report whether it was.
+///
+/// Matrix sends an edit as an ordinary `m.room.message` carrying the new text
+/// under `m.new_content` and a `m.replace` relation naming what it replaces.
+/// Its top-level body is a `"* new text"` fallback for clients that cannot
+/// apply edits — render that and the reader sees the message twice.
+fn record_if_edit(sh: &Arc<Shared>, ts: u64, content: &EventContent) -> Result<bool> {
+    let Some(rel) = content.relates_to.as_ref() else {
+        return Ok(false);
+    };
+    if rel.rel_type.as_deref() != Some("m.replace") {
+        return Ok(false);
+    }
+    let Some(target) = rel.event_id.as_deref() else {
+        return Ok(false);
+    };
+    let body = content
+        .new_content
+        .as_deref()
+        .and_then(|c| c.body.as_deref())
+        .or_else(|| {
+            content
+                .body
+                .as_deref()
+                .map(|b| b.strip_prefix("* ").unwrap_or(b))
+        })
+        .unwrap_or_default();
+    // An empty replacement is still an edit event, and still must not render.
+    if !body.is_empty() {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.record_edit(target, ts, body)?;
+    }
+    Ok(true)
 }
 
 /// Turn a timeline event into a `Message`, decrypting when needed.
@@ -726,6 +835,9 @@ fn convert_event(
     let mine = ev.sender == session.user_id;
     match ev.kind.as_str() {
         "m.room.message" => {
+            if record_if_edit(sh, ev.origin_server_ts, &ev.content)? {
+                return Ok(None);
+            }
             let body = ev.content.body.clone().unwrap_or_default();
             if body.is_empty() {
                 return Ok(None);
@@ -739,6 +851,8 @@ fn convert_event(
                 encrypted: false,
                 decrypted: true,
                 mine,
+                // Attached when reading, from what the room calls the sender.
+                sender_name: None,
                 session_id: None,
                 ciphertext: None,
             }))
@@ -758,14 +872,14 @@ fn convert_event(
                 }
             };
             let (body, decrypted) = match plain {
-                Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
-                    Ok(v) => {
-                        let b = v
-                            .get("content")
-                            .and_then(|c| c.get("body"))
-                            .and_then(|b| b.as_str())
-                            .unwrap_or_default()
-                            .to_string();
+                Ok(json) => match serde_json::from_str::<DecryptedEvent>(&json) {
+                    Ok(p) => {
+                        // An edit is encrypted like any other message, so this
+                        // is the first point at which one can be recognised.
+                        if record_if_edit(sh, ev.origin_server_ts, &p.content)? {
+                            return Ok(None);
+                        }
+                        let b = p.content.body.unwrap_or_default();
                         if b.is_empty() {
                             return Ok(None);
                         }
@@ -784,10 +898,19 @@ fn convert_event(
                 encrypted: true,
                 decrypted,
                 mine,
+                sender_name: None,
                 // Keep what a later key recovery needs, and only that: once
                 // decrypted these are stored as NULL again.
-                session_id: if decrypted { None } else { Some(sid.to_string()) },
-                ciphertext: if decrypted { None } else { Some(ct.to_string()) },
+                session_id: if decrypted {
+                    None
+                } else {
+                    Some(sid.to_string())
+                },
+                ciphertext: if decrypted {
+                    None
+                } else {
+                    Some(ct.to_string())
+                },
             }))
         }
         _ => Ok(None),
@@ -990,7 +1113,10 @@ pub fn do_backup_key(sh: &Arc<Shared>, key: &str) -> Result<usize> {
     {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        let c = net
+            .crypto
+            .as_mut()
+            .ok_or_else(|| anyhow!("no crypto state"))?;
         c.set_backup_key(&db, key, &info.public_key)?;
         db.set_meta("backup_version", &info.version)?;
     }
@@ -1015,12 +1141,7 @@ pub fn do_backup_key(sh: &Arc<Shared>, key: &str) -> Result<usize> {
 /// `GET /room_keys/keys`: this account's backup holds ~51k sessions, which
 /// would be tens of MB of RAM and rows on a 474 MB device. Opening a room
 /// fetches only the handful of sessions that room's visible history needs.
-pub fn restore_room(
-    sh: &Arc<Shared>,
-    api: &Arc<Api>,
-    version: &str,
-    room: &str,
-) -> Result<usize> {
+pub fn restore_room(sh: &Arc<Shared>, api: &Arc<Api>, version: &str, room: &str) -> Result<usize> {
     let pending = {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         db.undecrypted_in_room(room, BACKUP_RESTORE_WINDOW)?
@@ -1049,7 +1170,10 @@ pub fn restore_room(
         };
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        let c = net
+            .crypto
+            .as_mut()
+            .ok_or_else(|| anyhow!("no crypto state"))?;
         match c.import_backup_session(&db, room, session_id, &entry) {
             Ok(true) => imported += 1,
             Ok(false) => {}
@@ -1065,7 +1189,10 @@ pub fn restore_room(
     for (event_id, session_id, ciphertext) in &pending {
         let plain = {
             let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-            let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+            let c = net
+                .crypto
+                .as_mut()
+                .ok_or_else(|| anyhow!("no crypto state"))?;
             c.decrypt(session_id, ciphertext)
         };
         let Ok(json) = plain else { continue };
@@ -1122,6 +1249,7 @@ pub fn try_restore_room(sh: &Arc<Shared>, room: &str) {
 /// history is full of those, page it in once and try the backup again.
 pub fn repair_room(sh: &Arc<Shared>, room: &str) {
     try_restore_room(sh, room);
+    name_visible_senders(sh, room);
 
     // Counted over exactly the page about to be re-read: a wider window would
     // keep triggering re-reads of a page that never contained the stale rows.
@@ -1143,6 +1271,55 @@ pub fn repair_room(sh: &Arc<Shared>, room: &str) {
         }
     }
     try_restore_room(sh, room);
+}
+
+/// Put a name to the people visible in a room whose names we never learned.
+///
+/// `/sync` names anyone who speaks while we are running, but history synced
+/// earlier carries senders we know nothing about — and in a bridged room that
+/// means every message is signed `signal_<uuid>` or a phone number. Only the
+/// senders actually on screen are looked up, a few per open, so a room with a
+/// long cast converges over a few visits instead of one enormous fetch.
+fn name_visible_senders(sh: &Arc<Shared>, room: &str) {
+    let Some(api) = sh.api() else { return };
+    let unknown: Vec<String> = {
+        let Ok(db) = sh.db.lock() else { return };
+        let Ok(msgs) = db.recent_messages(room, REPAIR_BACKFILL) else {
+            return;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for m in &msgs {
+            if m.sender_name.is_none() && !seen.contains(&m.sender) {
+                seen.push(m.sender.clone());
+            }
+        }
+        seen.truncate(SENDER_LOOKUPS);
+        seen
+    };
+    if unknown.is_empty() {
+        return;
+    }
+
+    let mut found: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for user in unknown {
+        match api.profile_name(&user) {
+            Ok(Some(name)) => {
+                found.insert(user, Some(name));
+            }
+            // No display name, or the lookup failed: their localpart is what
+            // the timeline will keep showing, which is no worse than before.
+            Ok(None) => {}
+            Err(e) => eprintln!("kmatrixd: naming {user}: {e:#}"),
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    if let Ok(db) = sh.db.lock() {
+        if let Err(e) = db.remember_members(room, &found) {
+            eprintln!("kmatrixd: remembering names in {room}: {e:#}");
+        }
+    }
 }
 
 /// Re-fetch the newest page of a room's history, overwriting what we hold.
@@ -1241,7 +1418,10 @@ fn handle_verification_event(
 
     let step = {
         let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        let c = net
+            .crypto
+            .as_mut()
+            .ok_or_else(|| anyhow!("no crypto state"))?;
         c.handle_verification(
             &session.user_id,
             &session.device_id,
@@ -1258,7 +1438,10 @@ pub fn do_verify_confirm(sh: &Arc<Shared>, transaction: &str, confirm: bool) -> 
     let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
     let step = {
         let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
-        let c = net.crypto.as_mut().ok_or_else(|| anyhow!("no crypto state"))?;
+        let c = net
+            .crypto
+            .as_mut()
+            .ok_or_else(|| anyhow!("no crypto state"))?;
         c.confirm_verification(&session.user_id, &session.device_id, transaction, confirm)?
     };
     apply_verify_step(sh, &api, &session, step)
@@ -1497,9 +1680,7 @@ mod tests {
 
     #[test]
     fn a_single_remaining_member_is_not_pluralised() {
-        let jr = joined(
-            r#"{"summary":{"m.heroes":["@a:h"],"m.joined_member_count":3}}"#,
-        );
+        let jr = joined(r#"{"summary":{"m.heroes":["@a:h"],"m.joined_member_count":3}}"#);
         assert_eq!(name_from_heroes(&jr).as_deref(), Some("a and 1 other"));
     }
 
@@ -1533,20 +1714,25 @@ mod tests {
             ("@bob:h", None),
         ]);
         // Display name where the server has one, localpart where it does not.
-        assert_eq!(name_from_members("@me:h", &m).as_deref(), Some("Alice, bob"));
+        assert_eq!(
+            name_from_members("@me:h", &m).as_deref(),
+            Some("Alice, bob")
+        );
     }
 
     #[test]
     fn a_room_containing_only_us_is_empty() {
         let m = members(&[("@me:h", Some("Me"))]);
-        assert_eq!(name_from_members("@me:h", &m).as_deref(), Some("Empty room"));
+        assert_eq!(
+            name_from_members("@me:h", &m).as_deref(),
+            Some("Empty room")
+        );
     }
 
     #[test]
     fn a_crowd_is_capped_and_counted() {
-        let mut pairs: Vec<(String, Option<String>)> = (0..12)
-            .map(|i| (format!("@u{i:02}:h"), None))
-            .collect();
+        let mut pairs: Vec<(String, Option<String>)> =
+            (0..12).map(|i| (format!("@u{i:02}:h"), None)).collect();
         pairs.push(("@me:h".to_string(), None));
         let m: BTreeMap<_, _> = pairs.into_iter().collect();
         // Five named, thirteen members, ourselves excluded: seven left.
