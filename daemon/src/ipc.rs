@@ -330,7 +330,7 @@ mod tests {
     use std::sync::Condvar;
 
     fn shared(dir: &std::path::Path) -> Arc<Shared> {
-        let store = crate::store::Store::open(&dir.join("s.db")).expect("open store");
+        let store = crate::store::Store::open(&dir.join("s.db"), None).expect("open store");
         Arc::new(Shared {
             db: Mutex::new(store),
             net: Mutex::new(NetState { crypto: None }),

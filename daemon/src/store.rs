@@ -5,11 +5,64 @@
 //! The device is slow and may lose power at any moment, so the connection runs
 //! in WAL mode with `synchronous=NORMAL`: commits are durable across a process
 //! crash without paying an fsync per transaction on every sync round.
+//!
+//! # Encryption at rest
+//!
+//! This file lives on `/mnt/us`, the partition the Kindle exports over USB
+//! mass storage: plug the device into any computer and the whole database
+//! reads out, no authentication involved. So the sensitive columns are
+//! encrypted here and the master key lives on an internal partition that USB
+//! never exposes; the caller loads it and hands it to [`Store::open`].
+//!
+//! That is the whole of the threat model, stated honestly: this defends
+//! against someone with the USB cable. It does not defend against a root
+//! shell on the device, which can read the key file just as easily as the
+//! database. Anyone extending this should not mistake it for more.
+//!
+//! Encrypted: message bodies, room names and previews, the retained Megolm
+//! ciphertext, and the `session`, `backup_key` and `pickle_key` entries of
+//! `meta` -- the access token and both long-term secrets.
+//!
+//! Deliberately **not** encrypted, and you should know this before trusting
+//! the file: event ids, room ids, senders, timestamps, and the `pickle`
+//! table's `kind`/`id`/`extra` columns. Message *contents* are protected;
+//! *metadata* -- who talked to whom, when, in which room -- is not. Hiding it
+//! would mean giving up the `(room, ts)` index the device needs to open a
+//! room without a full scan, and the session-id lookups the crypto layer does
+//! on every encrypted event.
+//!
+//! The pickle blobs themselves are also left alone, on purpose. A libolm
+//! pickle is already AES-256-CBC ciphertext under `pickle_key`, and
+//! `pickle_key` is now itself encrypted, so the pickles are protected
+//! transitively. Encrypting them again would buy nothing and cost a second
+//! decrypt for every Megolm session at startup, of which there are hundreds.
+//!
+//! An encrypted value is stored as TEXT in the column it replaces:
+//!
+//! ```text
+//! "k1:" || base64_standard( salt[16] || mac[32] || aes_256_cbc_ciphertext )
+//! ```
+//!
+//! Every value gets a fresh 16-byte salt and is keyed with `master || salt`.
+//! That is not belt-and-braces: `Cipher::new_pickle` derives the AES key, the
+//! MAC key *and the IV* from the key material it is given, so one key means
+//! one IV, and a fixed IV across values is a textbook CBC break -- two
+//! messages sharing a prefix would share leading ciphertext blocks. The salt
+//! is what makes each value's IV distinct.
+//!
+//! The `k1:` prefix is how an encrypted value is told from a legacy plaintext
+//! one, which is what lets a database be migrated in place and stay readable
+//! while half-migrated. A plaintext value that happened to begin with `k1:`
+//! would be misread, but the window for that closes at migration: afterwards
+//! every value in these columns really is `k1:`-prefixed.
 
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
+use vodozemac::hazmat::{Cipher, Mac};
 
 use crate::model::{Message, Room, Session};
 
@@ -60,19 +113,152 @@ CREATE TABLE IF NOT EXISTS pickle (
 /// Key under which the serialized [`Session`] lives in `meta`.
 const SESSION_KEY: &str = "session";
 
+/// The `meta` entries that are secrets, each with the label used when an error
+/// has to name it. Everything else in `meta` stays plaintext: `sync_token`,
+/// `backup_version` and `device_keys_published` are not secrets, and
+/// [`ENCRYPTED_FLAG`] in particular has to be readable *before* the key is
+/// known.
+const SECRET_META_KEYS: [(&str, &str); 3] = [
+    (SESSION_KEY, "meta.session"),
+    ("backup_key", "meta.backup_key"),
+    ("pickle_key", "meta.pickle_key"),
+];
+
+/// Plaintext `meta` flag, set once every value covered by encryption has been
+/// re-encrypted. Its absence, with a key configured, is what triggers the
+/// one-time migration.
+const ENCRYPTED_FLAG: &str = "store_encrypted";
+
+/// Marks a column value as encrypted and names the format, so a future format
+/// can be told from this one instead of being decrypted as garbage.
+const ENC_PREFIX: &str = "k1:";
+
+/// Per-value salt. Sixteen bytes is the CBC block size and plenty to keep the
+/// derived IVs from colliding across the ~12k values on a real device.
+const SALT_LEN: usize = 16;
+
+/// Full-length HMAC-SHA256 tag, as produced by [`Cipher::mac`].
+const MAC_LEN: usize = Mac::LENGTH;
+
 pub struct Store {
     conn: Connection,
+    /// The master key, or `None` to run unencrypted exactly as before it
+    /// existed. Every read and write in this file goes through it.
+    key: Option<[u8; 32]>,
+}
+
+/// `meta` is matched against a fixed list rather than encrypted wholesale,
+/// because [`ENCRYPTED_FLAG`] and the sync token must stay readable without a
+/// key.
+fn secret_meta_label(k: &str) -> Option<&'static str> {
+    SECRET_META_KEYS
+        .iter()
+        .find(|(name, _)| *name == k)
+        .map(|(_, label)| *label)
+}
+
+/// The cipher for one value. `Cipher::new_pickle` accepts an arbitrary-length
+/// key and runs HKDF-SHA256 over it, so appending a fresh salt to the master
+/// key gives this value its own AES key, MAC key and IV.
+fn value_cipher(master: &[u8; 32], salt: &[u8; SALT_LEN]) -> Cipher {
+    let mut keyed = [0u8; 32 + SALT_LEN];
+    keyed[..32].copy_from_slice(master);
+    keyed[32..].copy_from_slice(salt);
+    Cipher::new_pickle(&keyed)
+}
+
+/// Encrypt one value into the `k1:` form described at the top of the file.
+fn seal(master: &[u8; 32], plaintext: &str) -> String {
+    let salt: [u8; SALT_LEN] = rand::random();
+    let cipher = value_cipher(master, &salt);
+    let ciphertext = cipher.encrypt(plaintext.as_bytes());
+    let mac = cipher.mac(&ciphertext);
+
+    let mut blob = Vec::with_capacity(SALT_LEN + MAC_LEN + ciphertext.len());
+    blob.extend_from_slice(&salt);
+    blob.extend_from_slice(mac.as_bytes());
+    blob.extend_from_slice(&ciphertext);
+
+    let mut out = String::with_capacity(ENC_PREFIX.len() + blob.len().div_ceil(3) * 4);
+    out.push_str(ENC_PREFIX);
+    base64::engine::general_purpose::STANDARD.encode_string(&blob, &mut out);
+    out
+}
+
+/// Read one stored value back. `column` names the column in any error, since
+/// by the time this fails the caller has lost sight of what it was reading.
+///
+/// A value without the prefix is legacy plaintext and comes back untouched --
+/// by value, so the common case does not copy. That is what keeps an
+/// unencrypted database working and a half-migrated one intact.
+fn unseal(master: Option<&[u8; 32]>, column: &str, stored: String) -> Result<String> {
+    let Some(encoded) = stored.strip_prefix(ENC_PREFIX) else {
+        return Ok(stored);
+    };
+    let Some(master) = master else {
+        // Never fall back to handing the ciphertext or an empty string to the
+        // caller: that would look like an empty room to the UI, and the next
+        // write would overwrite real history with the emptiness.
+        bail!(
+            "{column} is encrypted but no store key is configured -- the store key file \
+             is missing or unreadable. The message history and the access token are in \
+             this database and cannot be recovered without that key; restore it rather \
+             than deleting anything."
+        );
+    };
+
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("decode encrypted {column}"))?;
+    if blob.len() < SALT_LEN + MAC_LEN {
+        bail!(
+            "encrypted {column} is truncated: {} bytes, need at least {}",
+            blob.len(),
+            SALT_LEN + MAC_LEN
+        );
+    }
+    let (salt, rest) = blob.split_at(SALT_LEN);
+    let (mac, ciphertext) = rest.split_at(MAC_LEN);
+    let mut salt_buf = [0u8; SALT_LEN];
+    salt_buf.copy_from_slice(salt);
+    let cipher = value_cipher(master, &salt_buf);
+
+    // Authenticate before decrypting, so a tampered blob never reaches the
+    // unpadding code. `Cipher::verify_mac` is gated behind vodozemac's
+    // `experimental-session-config` feature, which we do not enable;
+    // `verify_truncated_mac` is the same constant-time HMAC comparison against
+    // the leftmost `tag.len()` bytes, so handing it all 32 verifies the whole
+    // tag with no truncation at all.
+    cipher.verify_truncated_mac(ciphertext, mac).map_err(|_| {
+        anyhow!(
+            "{column} failed authentication: the stored value has been altered, or the \
+             store key does not belong to this database -- the data cannot be recovered \
+             without the key it was written with"
+        )
+    })?;
+    let plain = cipher
+        .decrypt(ciphertext)
+        .map_err(|e| anyhow!("decrypt {column}: {e}"))?;
+    String::from_utf8(plain).with_context(|| format!("decrypted {column} is not valid UTF-8"))
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Store> {
+    /// `key` is the master key for encryption at rest, or `None` to run
+    /// unencrypted exactly as this store did before encryption existed. Where
+    /// the key file lives and how it is created is the caller's business; this
+    /// module never touches it.
+    ///
+    /// Opening with a key on a database that has not been encrypted yet
+    /// migrates it in place, once. Opening *without* a key on one that has is
+    /// refused outright rather than quietly writing plaintext beside it.
+    pub fn open(path: &Path, key: Option<[u8; 32]>) -> Result<Store> {
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("create store directory {}", dir.display()))?;
             }
         }
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .with_context(|| format!("open store database {}", path.display()))?;
 
         // `journal_mode` reports the resulting mode as a result row, so it has
@@ -95,7 +281,61 @@ impl Store {
 
         conn.execute_batch(SCHEMA).context("create schema")?;
         migrate(&conn)?;
-        Ok(Store { conn })
+
+        // Plaintext by design: this flag has to be legible before the key is
+        // known, since it is what says whether a key is needed at all.
+        let flag: Option<String> = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                params![ENCRYPTED_FLAG],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read store encryption flag")?;
+        let encrypted = flag.as_deref() == Some("1");
+
+        match &key {
+            Some(master) if !encrypted => encrypt_existing(&mut conn, master)?,
+            None if encrypted => bail!(
+                "store database {} is encrypted but no store key was supplied -- the key \
+                 file is missing or unreadable. The message history, the room list and \
+                 the access token in it cannot be read or recovered without that key. \
+                 Nothing has been modified; restore the key file.",
+                path.display()
+            ),
+            // Key and flag agree, or there is nothing to protect: carry on.
+            _ => {}
+        }
+
+        Ok(Store { conn, key })
+    }
+
+    // ----------------------------------------------------------- encryption
+
+    /// Wrap a value on its way into the database. Borrows straight through
+    /// when no key is configured, so the unencrypted path costs no allocation.
+    fn protect<'a>(&self, plain: &'a str) -> Cow<'a, str> {
+        match &self.key {
+            Some(master) => Cow::Owned(seal(master, plain)),
+            None => Cow::Borrowed(plain),
+        }
+    }
+
+    fn protect_opt<'a>(&self, plain: Option<&'a str>) -> Option<Cow<'a, str>> {
+        plain.map(|p| self.protect(p))
+    }
+
+    /// Unwrap a value read back out of `column`, which names the column in any
+    /// error so a failure points at the row that caused it.
+    fn reveal(&self, column: &str, stored: String) -> Result<String> {
+        unseal(self.key.as_ref(), column, stored)
+    }
+
+    fn reveal_opt(&self, column: &str, stored: Option<String>) -> Result<Option<String>> {
+        match stored {
+            Some(s) => Ok(Some(self.reveal(column, s)?)),
+            None => Ok(None),
+        }
     }
 
     // -------------------------------------------------------------- session
@@ -127,6 +367,13 @@ impl Store {
                  COMMIT;",
             )
             .context("clear store")?;
+        // The wipe took `store_encrypted` with it. Put it straight back while
+        // the key is still in hand, so the invariant "key configured implies
+        // flag set" holds and the next open does not walk an empty database
+        // looking for values to migrate.
+        if self.key.is_some() {
+            mark_encrypted(&self.conn)?;
+        }
         // DELETE only frees pages; the file never shrinks on its own. VACUUM
         // rebuilds it compactly -- but in WAL mode the rebuilt pages land in
         // the WAL, so the *old* pages (with the access token) stay in the main
@@ -152,24 +399,35 @@ impl Store {
 
     // ----------------------------------------------------------------- meta
 
+    /// Only the three secret keys are encrypted; see [`SECRET_META_KEYS`] for
+    /// why the rest must stay legible.
     pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
+        let stored = match secret_meta_label(k) {
+            Some(_) => self.protect(v),
+            None => Cow::Borrowed(v),
+        };
         self.conn
             .execute(
                 "INSERT INTO meta (k, v) VALUES (?1, ?2)
                  ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                params![k, v],
+                params![k, stored.as_ref()],
             )
             .with_context(|| format!("write meta key {k}"))?;
         Ok(())
     }
 
     pub fn get_meta(&self, k: &str) -> Result<Option<String>> {
-        self.conn
+        let stored: Option<String> = self
+            .conn
             .query_row("SELECT v FROM meta WHERE k = ?1", params![k], |row| {
                 row.get(0)
             })
             .optional()
-            .with_context(|| format!("read meta key {k}"))
+            .with_context(|| format!("read meta key {k}"))?;
+        match secret_meta_label(k) {
+            Some(label) => self.reveal_opt(label, stored),
+            None => Ok(stored),
+        }
     }
 
     // ---------------------------------------------------------------- rooms
@@ -179,6 +437,8 @@ impl Store {
     /// sync upserts a room on every round, and including them would reset the
     /// pagination edge to NULL each time, losing the backfill progress.
     pub fn upsert_room(&self, r: &Room) -> Result<()> {
+        let name = self.protect(&r.name);
+        let preview = self.protect(&r.last_preview);
         self.conn
             .execute(
                 "INSERT INTO room (id, name, encrypted, unread, last_ts, last_preview)
@@ -191,11 +451,11 @@ impl Store {
                      last_preview = excluded.last_preview",
                 params![
                     r.id,
-                    r.name,
+                    name.as_ref(),
                     r.encrypted as i64,
                     r.unread as i64,
                     r.last_ts as i64,
-                    r.last_preview,
+                    preview.as_ref(),
                 ],
             )
             .with_context(|| format!("upsert room {}", r.id))?;
@@ -224,7 +484,10 @@ impl Store {
             .context("query rooms")?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.context("read room row")?);
+            let mut r = r.context("read room row")?;
+            r.name = self.reveal("room.name", r.name)?;
+            r.last_preview = self.reveal("room.last_preview", r.last_preview)?;
+            out.push(r);
         }
         Ok(out)
     }
@@ -233,7 +496,8 @@ impl Store {
     /// doing it with `list_rooms()` is a full table scan each time, which on
     /// a 766-room account is ~590k row materializations per full sync.
     pub fn get_room(&self, id: &str) -> Result<Option<Room>> {
-        self.conn
+        let row = self
+            .conn
             .query_row(
                 "SELECT id, name, encrypted, unread, last_ts, last_preview
                  FROM room WHERE id = ?1",
@@ -250,7 +514,15 @@ impl Store {
                 },
             )
             .optional()
-            .with_context(|| format!("get room {id}"))
+            .with_context(|| format!("get room {id}"))?;
+        match row {
+            Some(mut r) => {
+                r.name = self.reveal("room.name", r.name)?;
+                r.last_preview = self.reveal("room.last_preview", r.last_preview)?;
+                Ok(Some(r))
+            }
+            None => Ok(None),
+        }
     }
 
     // ------------------------------------------------- backwards pagination
@@ -312,7 +584,17 @@ impl Store {
     /// Idempotent by `event_id`. A re-insert may only *upgrade* a row: when a
     /// room key arrives late, the same event is written again with the plain
     /// body and `decrypted = 1`, replacing the placeholder in place.
+    ///
+    /// `ciphertext` is encrypted along with `body`. It is Megolm ciphertext,
+    /// so it is not readable plaintext to begin with -- but it is readable to
+    /// anyone who later gets the room key, which is exactly what the key
+    /// backup hands out, and it sits in the same column family as the body it
+    /// will become. Encrypting it keeps one rule for the whole row instead of
+    /// an exception to explain. `session_id` stays plaintext: it is a lookup
+    /// key, and the crypto layer matches on it.
     pub fn insert_message(&self, m: &Message) -> Result<()> {
+        let body = self.protect(&m.body);
+        let ciphertext = self.protect_opt(m.ciphertext.as_deref());
         self.conn
             .execute(
                 "INSERT INTO message
@@ -329,12 +611,12 @@ impl Store {
                     m.room,
                     m.sender,
                     m.ts as i64,
-                    m.body,
+                    body.as_ref(),
                     m.encrypted as i64,
                     m.decrypted as i64,
                     m.mine as i64,
                     m.session_id,
-                    m.ciphertext,
+                    ciphertext.as_deref(),
                 ],
             )
             .with_context(|| format!("insert message {}", m.event_id))?;
@@ -371,7 +653,10 @@ impl Store {
             .with_context(|| format!("query messages for {room}"))?;
         let mut out = Vec::with_capacity(limit.min(512) as usize);
         for m in rows {
-            out.push(m.context("read message row")?);
+            let mut m = m.context("read message row")?;
+            m.body = self.reveal("message.body", m.body)?;
+            m.ciphertext = self.reveal_opt("message.ciphertext", m.ciphertext.take())?;
+            out.push(m);
         }
         out.reverse();
         Ok(out)
@@ -404,7 +689,10 @@ impl Store {
             .with_context(|| format!("query undecrypted messages for {room}"))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.context("read undecrypted message row")?);
+            let (event_id, session_id, ciphertext): (String, String, String) =
+                r.context("read undecrypted message row")?;
+            let ciphertext = self.reveal("message.ciphertext", ciphertext)?;
+            out.push((event_id, session_id, ciphertext));
         }
         Ok(out)
     }
@@ -416,12 +704,13 @@ impl Store {
     /// A row that is no longer there is not an error; the backlog may have been
     /// trimmed between listing the retries and finishing them.
     pub fn upgrade_message(&self, event_id: &str, body: &str) -> Result<()> {
+        let body = self.protect(body);
         self.conn
             .execute(
                 "UPDATE message
                  SET body = ?2, decrypted = 1, session_id = NULL, ciphertext = NULL
                  WHERE event_id = ?1",
-                params![event_id, body],
+                params![event_id, body.as_ref()],
             )
             .with_context(|| format!("upgrade message {event_id}"))?;
         Ok(())
@@ -498,6 +787,151 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Set the plaintext flag that says every value covered by encryption is
+/// encrypted. Takes a bare `&Connection` so it can be written through a
+/// transaction handle, landing atomically with the values it describes.
+fn mark_encrypted(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (k, v) VALUES (?1, '1')
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![ENCRYPTED_FLAG],
+    )
+    .context("mark store encrypted")?;
+    Ok(())
+}
+
+/// Re-encrypt everything encryption covers, then set [`ENCRYPTED_FLAG`], all
+/// in one transaction. Runs once, on the first open with a key.
+///
+/// Idempotent by construction: a value that already carries [`ENC_PREFIX`] is
+/// left exactly as it is, so an interrupted run costs only the work it had
+/// already done. Nothing here can lose data -- either the transaction commits
+/// whole or the database is untouched and the flag stays unset, and the next
+/// open tries again.
+fn encrypt_existing(conn: &mut Connection, master: &[u8; 32]) -> Result<()> {
+    // Immediate, not deferred: take the write lock up front rather than
+    // discovering halfway through a 12k-row rewrite that another process holds
+    // it and having to roll the whole thing back.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("begin store encryption")?;
+
+    for (key, label) in SECRET_META_KEYS {
+        let stored: Option<String> = tx
+            .query_row("SELECT v FROM meta WHERE k = ?1", params![key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .with_context(|| format!("read {label} for encryption"))?;
+        let Some(value) = stored else { continue };
+        if value.starts_with(ENC_PREFIX) {
+            continue;
+        }
+        tx.execute(
+            "UPDATE meta SET v = ?2 WHERE k = ?1",
+            params![key, seal(master, &value)],
+        )
+        .with_context(|| format!("encrypt {label}"))?;
+    }
+
+    // Rooms are few -- hundreds even on a heavy account -- and names and
+    // previews are short, so the whole table fits in memory comfortably.
+    let rooms: Vec<(String, String, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, name, last_preview FROM room")
+            .context("prepare room encryption scan")?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .context("scan rooms for encryption")?;
+        let mut rooms = Vec::new();
+        for r in mapped {
+            rooms.push(r.context("read room row for encryption")?);
+        }
+        rooms
+    };
+    {
+        let mut update = tx
+            .prepare("UPDATE room SET name = ?2, last_preview = ?3 WHERE id = ?1")
+            .context("prepare room encryption update")?;
+        for (id, name, preview) in rooms {
+            let name_done = name.starts_with(ENC_PREFIX);
+            let preview_done = preview.starts_with(ENC_PREFIX);
+            if name_done && preview_done {
+                continue;
+            }
+            let name = if name_done { name } else { seal(master, &name) };
+            let preview = if preview_done {
+                preview
+            } else {
+                seal(master, &preview)
+            };
+            update
+                .execute(params![id, name, preview])
+                .with_context(|| format!("encrypt room {id}"))?;
+        }
+    }
+
+    // Messages are the big table: ~12k rows on the live device, bodies of
+    // arbitrary length. Walk it in rowid-ordered chunks so peak memory stays
+    // bounded by the chunk rather than the backlog, and so the scan never
+    // reads rows this same transaction is rewriting -- SQLite leaves that
+    // undefined. Rewriting a body cannot change a rowid, so the cursor keeps
+    // moving forward.
+    const CHUNK: usize = 512;
+    let mut after: i64 = 0;
+    let mut batch: Vec<(i64, String, Option<String>)> = Vec::with_capacity(CHUNK);
+    loop {
+        batch.clear();
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT rowid, body, ciphertext FROM message
+                     WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                )
+                .context("prepare message encryption scan")?;
+            let mapped = stmt
+                .query_map(params![after, CHUNK as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .context("scan messages for encryption")?;
+            for m in mapped {
+                batch.push(m.context("read message row for encryption")?);
+            }
+        }
+        let Some((last, _, _)) = batch.last() else {
+            break;
+        };
+        after = *last;
+
+        let mut update = tx
+            .prepare_cached("UPDATE message SET body = ?2, ciphertext = ?3 WHERE rowid = ?1")
+            .context("prepare message encryption update")?;
+        for (rowid, body, ciphertext) in batch.drain(..) {
+            let body_done = body.starts_with(ENC_PREFIX);
+            let ciphertext_done = match &ciphertext {
+                Some(c) => c.starts_with(ENC_PREFIX),
+                // Nothing to encrypt is nothing to do.
+                None => true,
+            };
+            if body_done && ciphertext_done {
+                continue;
+            }
+            let body = if body_done { body } else { seal(master, &body) };
+            let ciphertext = match ciphertext {
+                Some(c) if !ciphertext_done => Some(seal(master, &c)),
+                other => other,
+            };
+            update
+                .execute(params![rowid, body, ciphertext])
+                .with_context(|| format!("encrypt message rowid {rowid}"))?;
+        }
+    }
+
+    mark_encrypted(&tx)?;
+    tx.commit().context("commit store encryption")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,12 +955,69 @@ mod tests {
             self.dir.join("store.db")
         }
 
+        /// The unencrypted store, which is what the pre-encryption tests all
+        /// exercise.
         fn open(&self) -> Store {
-            match Store::open(&self.dir.join("store.db")) {
+            match Store::open(&self.path(), None) {
                 Ok(s) => s,
                 Err(e) => panic!("open store: {e:#}"),
             }
         }
+
+        /// The same store with encryption on, under [`KEY_A`].
+        fn keyed(&self) -> Store {
+            match Store::open(&self.path(), Some(KEY_A)) {
+                Ok(s) => s,
+                Err(e) => panic!("open keyed store: {e:#}"),
+            }
+        }
+
+        /// A second, plain connection to the same file. Encryption tests read
+        /// raw column text through this to check what actually hit the disk;
+        /// asking the `Store` would only ever show them the plaintext again.
+        fn raw(&self) -> Connection {
+            match Connection::open(self.path()) {
+                Ok(c) => c,
+                Err(e) => panic!("open raw connection: {e}"),
+            }
+        }
+    }
+
+    const KEY_A: [u8; 32] = [0x5a; 32];
+    const KEY_B: [u8; 32] = [0xa5; 32];
+
+    /// One TEXT cell, straight off the disk with no decryption in the way.
+    fn raw_cell(conn: &Connection, sql: &str, key: &str) -> String {
+        match conn.query_row(sql, params![key], |row| row.get::<_, String>(0)) {
+            Ok(v) => v,
+            Err(e) => panic!("read raw cell ({sql}) for {key}: {e}"),
+        }
+    }
+
+    fn raw_body(conn: &Connection, event_id: &str) -> String {
+        raw_cell(
+            conn,
+            "SELECT body FROM message WHERE event_id = ?1",
+            event_id,
+        )
+    }
+
+    fn raw_meta(conn: &Connection, k: &str) -> String {
+        raw_cell(conn, "SELECT v FROM meta WHERE k = ?1", k)
+    }
+
+    /// Asserts that `stored` is an encrypted blob and that `plain` is nowhere
+    /// in it -- the second half is the point, since a prefix alone would also
+    /// be satisfied by `"k1:" + plaintext`.
+    fn assert_sealed(stored: &str, plain: &str, what: &str) {
+        assert!(
+            stored.starts_with(ENC_PREFIX),
+            "{what} was stored unencrypted: {stored}"
+        );
+        assert!(
+            !stored.contains(plain),
+            "{what} leaks its plaintext into the stored blob: {stored}"
+        );
     }
 
     impl Drop for TempDb {
@@ -587,7 +1078,7 @@ mod tests {
     fn open_creates_missing_parent_dirs() {
         let tmp = TempDb::new();
         let path = tmp.dir.join("nested/deeper/store.db");
-        let store = Store::open(&path).expect("open nested");
+        let store = Store::open(&path, None).expect("open nested");
         store.set_meta("k", "v").expect("write");
         assert!(path.exists());
     }
@@ -1189,5 +1680,607 @@ mod tests {
             (Some("t_page1".to_string()), true)
         );
         assert_eq!(store.list_rooms().expect("list after reopen").len(), 1);
+    }
+
+    // -------------------------------------------------- encryption at rest
+
+    fn sample_session() -> Session {
+        Session {
+            homeserver: "https://example.org".into(),
+            user_id: "@alice:example.org".into(),
+            device_id: "DEV1".into(),
+            access_token: "syt_supersecret_token".into(),
+        }
+    }
+
+    /// Every value-bearing cell of every table encryption touches, exactly as
+    /// stored. Used to prove an operation left the database alone.
+    fn snapshot(conn: &Connection) -> Vec<String> {
+        const QUERIES: [&str; 3] = [
+            "SELECT k || '=' || v FROM meta ORDER BY k",
+            "SELECT id || '=' || name || '/' || last_preview FROM room ORDER BY id",
+            "SELECT event_id || '=' || body || '/' || COALESCE(ciphertext, '')
+             FROM message ORDER BY event_id",
+        ];
+        let mut out = Vec::new();
+        for sql in QUERIES {
+            let mut stmt = match conn.prepare(sql) {
+                Ok(s) => s,
+                Err(e) => panic!("prepare snapshot query: {e}"),
+            };
+            let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                Ok(r) => r,
+                Err(e) => panic!("run snapshot query: {e}"),
+            };
+            for r in rows {
+                match r {
+                    Ok(v) => out.push(v),
+                    Err(e) => panic!("read snapshot row: {e}"),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn message_contents_round_trip_and_never_reach_the_disk_in_the_clear() {
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+        const BODY: &str = "the quick brown fox jumps over the lazy dog";
+        const MEGOLM: &str = "AwgAEnB1-MEGOLM-CIPHERTEXT";
+
+        let mut m = msg("$e1", 10, BODY, true);
+        m.session_id = Some("SESSION-1".into());
+        m.ciphertext = Some(MEGOLM.into());
+        store.insert_message(&m).expect("insert");
+
+        let got = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, BODY);
+        assert_eq!(got[0].ciphertext.as_deref(), Some(MEGOLM));
+
+        let raw = tmp.raw();
+        assert_sealed(&raw_body(&raw, "$e1"), BODY, "message.body");
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT ciphertext FROM message WHERE event_id = ?1",
+                "$e1",
+            ),
+            MEGOLM,
+            "message.ciphertext",
+        );
+        // The other half of the decision, asserted so it is impossible to
+        // change it by accident: metadata is stored in the clear.
+        assert_eq!(
+            raw_cell(
+                &raw,
+                "SELECT session_id FROM message WHERE event_id = ?1",
+                "$e1"
+            ),
+            "SESSION-1",
+            "session_id is a lookup key the crypto layer matches on"
+        );
+        assert_eq!(
+            raw_cell(
+                &raw,
+                "SELECT sender FROM message WHERE event_id = ?1",
+                "$e1"
+            ),
+            "@alice:example.org",
+            "senders are metadata and are not protected"
+        );
+    }
+
+    #[test]
+    fn room_and_secret_meta_are_encrypted_but_the_sync_token_is_not() {
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+
+        store
+            .upsert_room(&Room {
+                id: "!r:example.org".into(),
+                name: "Nuclear Codes".into(),
+                encrypted: true,
+                unread: 2,
+                last_ts: 99,
+                last_preview: "meet me at midnight".into(),
+            })
+            .expect("upsert room");
+        store.save_session(&sample_session()).expect("save session");
+        store
+            .set_meta("pickle_key", "PICKLE-KEY-MATERIAL")
+            .expect("pickle key");
+        store
+            .set_meta("backup_key", "BACKUP-KEY-MATERIAL")
+            .expect("backup key");
+        store.set_meta("sync_token", "s_12345").expect("sync token");
+        store
+            .set_meta("backup_version", "7")
+            .expect("backup version");
+
+        // Everything reads back exactly as written, through both room paths.
+        let got = store
+            .get_room("!r:example.org")
+            .expect("get room")
+            .expect("room present");
+        assert_eq!(got.name, "Nuclear Codes");
+        assert_eq!(got.last_preview, "meet me at midnight");
+        let listed = store.list_rooms().expect("list rooms");
+        assert_eq!(listed[0].name, "Nuclear Codes");
+        assert_eq!(listed[0].last_preview, "meet me at midnight");
+        assert_eq!(
+            store
+                .load_session()
+                .expect("load session")
+                .expect("session present")
+                .access_token,
+            "syt_supersecret_token"
+        );
+        assert_eq!(
+            store.get_meta("pickle_key").expect("get").as_deref(),
+            Some("PICKLE-KEY-MATERIAL")
+        );
+        assert_eq!(
+            store.get_meta("backup_key").expect("get").as_deref(),
+            Some("BACKUP-KEY-MATERIAL")
+        );
+        assert_eq!(
+            store.get_meta("sync_token").expect("get").as_deref(),
+            Some("s_12345")
+        );
+
+        let raw = tmp.raw();
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT name FROM room WHERE id = ?1",
+                "!r:example.org",
+            ),
+            "Nuclear Codes",
+            "room.name",
+        );
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT last_preview FROM room WHERE id = ?1",
+                "!r:example.org",
+            ),
+            "meet me at midnight",
+            "room.last_preview",
+        );
+        assert_eq!(
+            raw_cell(&raw, "SELECT id FROM room WHERE id = ?1", "!r:example.org"),
+            "!r:example.org",
+            "room ids are metadata and stay plaintext"
+        );
+
+        assert_sealed(
+            &raw_meta(&raw, SESSION_KEY),
+            "syt_supersecret_token",
+            "meta.session",
+        );
+        assert_sealed(
+            &raw_meta(&raw, "pickle_key"),
+            "PICKLE-KEY-MATERIAL",
+            "meta.pickle_key",
+        );
+        assert_sealed(
+            &raw_meta(&raw, "backup_key"),
+            "BACKUP-KEY-MATERIAL",
+            "meta.backup_key",
+        );
+        assert_eq!(
+            raw_meta(&raw, "sync_token"),
+            "s_12345",
+            "the sync token is not a secret and must stay readable"
+        );
+        assert_eq!(raw_meta(&raw, "backup_version"), "7");
+        assert_eq!(
+            raw_meta(&raw, ENCRYPTED_FLAG),
+            "1",
+            "the flag has to be legible before the key is known"
+        );
+    }
+
+    /// The IV is derived from the key material, so a fixed key means a fixed
+    /// IV, and CBC under a fixed IV turns equal plaintexts into equal
+    /// ciphertexts. This is the test that catches that.
+    #[test]
+    fn identical_plaintext_encrypts_to_different_blobs() {
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+        const BODY: &str = "the same words twice, under the same master key";
+
+        store
+            .insert_message(&msg("$first", 10, BODY, true))
+            .expect("insert first");
+        store
+            .insert_message(&msg("$second", 20, BODY, true))
+            .expect("insert second");
+
+        let raw = tmp.raw();
+        let a = raw_body(&raw, "$first");
+        let b = raw_body(&raw, "$second");
+        assert_sealed(&a, BODY, "message.body");
+        assert_sealed(&b, BODY, "message.body");
+        assert_ne!(
+            a, b,
+            "the same plaintext under the same master key produced the same stored blob: \
+             the per-value salt is not being applied and the CBC IV is being reused"
+        );
+
+        // Not just different overall -- different in the salt, which is what
+        // makes the rest differ.
+        let decode = |s: &str| {
+            let encoded = match s.strip_prefix(ENC_PREFIX) {
+                Some(e) => e,
+                None => panic!("stored value is not encrypted: {s}"),
+            };
+            match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                Ok(b) => b,
+                Err(e) => panic!("decode stored blob: {e}"),
+            }
+        };
+        assert_ne!(
+            decode(&a)[..SALT_LEN],
+            decode(&b)[..SALT_LEN],
+            "the two values were salted identically"
+        );
+
+        // Both still decrypt to what went in.
+        let got = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(
+            got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            vec![BODY, BODY]
+        );
+    }
+
+    #[test]
+    fn a_tampered_blob_fails_loudly_instead_of_decoding_to_garbage() {
+        // Once for each region of the blob: the salt, the MAC, the ciphertext.
+        // A flip anywhere must be caught before anything is handed back.
+        for byte in [0usize, SALT_LEN, SALT_LEN + MAC_LEN] {
+            let tmp = TempDb::new();
+            let store = tmp.keyed();
+            store
+                .insert_message(&msg("$e1", 10, "authentic and unaltered", true))
+                .expect("insert");
+
+            let raw = tmp.raw();
+            let stored = raw_body(&raw, "$e1");
+            let encoded = match stored.strip_prefix(ENC_PREFIX) {
+                Some(e) => e,
+                None => panic!("stored value is not encrypted: {stored}"),
+            };
+            let mut blob = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                Ok(b) => b,
+                Err(e) => panic!("decode stored blob: {e}"),
+            };
+            assert!(byte < blob.len(), "blob too short to tamper at {byte}");
+            blob[byte] ^= 0x01;
+            let tampered = format!(
+                "{ENC_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(&blob)
+            );
+            raw.execute(
+                "UPDATE message SET body = ?2 WHERE event_id = ?1",
+                params!["$e1", tampered],
+            )
+            .expect("write tampered body");
+
+            let err = store
+                .recent_messages("!r:example.org", 50)
+                .expect_err("a tampered body must not be readable");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("message.body"),
+                "byte {byte}: the error must name the column: {text}"
+            );
+            assert!(
+                text.contains("failed authentication"),
+                "byte {byte}: the error must say the MAC failed: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_master_key_cannot_read_the_store() {
+        let tmp = TempDb::new();
+        {
+            let store = tmp.keyed();
+            store
+                .insert_message(&msg("$e1", 10, "for my eyes only", true))
+                .expect("insert");
+            store.set_meta("pickle_key", "PICKLE").expect("pickle key");
+        }
+
+        // The open itself succeeds: a key was supplied and the flag is set, so
+        // nothing looks wrong until a value is actually read.
+        let store = Store::open(&tmp.path(), Some(KEY_B)).expect("open with the wrong key");
+
+        let err = store
+            .recent_messages("!r:example.org", 50)
+            .expect_err("the wrong key must not decrypt message bodies");
+        assert!(
+            format!("{err:#}").contains("failed authentication"),
+            "{err:#}"
+        );
+
+        let err = store
+            .get_meta("pickle_key")
+            .expect_err("the wrong key must not decrypt secret meta");
+        let text = format!("{err:#}");
+        assert!(text.contains("meta.pickle_key"), "{text}");
+
+        // The right key still works, so nothing was damaged by trying.
+        let store = tmp.keyed();
+        assert_eq!(
+            store.recent_messages("!r:example.org", 50).expect("recent")[0].body,
+            "for my eyes only"
+        );
+    }
+
+    #[test]
+    fn opening_an_encrypted_store_without_a_key_errors_and_changes_nothing() {
+        let tmp = TempDb::new();
+        {
+            let store = tmp.keyed();
+            store
+                .insert_message(&msg("$e1", 10, "history", true))
+                .expect("insert");
+            store
+                .insert_message(&msg("$e2", 20, "more history", true))
+                .expect("insert");
+            store.save_session(&sample_session()).expect("session");
+        }
+
+        let before = snapshot(&tmp.raw());
+        let rows_before = before.len();
+        assert!(rows_before > 0, "the fixture wrote nothing");
+
+        // Not `expect_err`: that would need `Debug` on `Store`, and a store
+        // holds the master key -- it has no business being printable.
+        let text = match Store::open(&tmp.path(), None) {
+            Ok(_) => panic!("opening an encrypted store with no key must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(text.contains("encrypted"), "{text}");
+        assert!(text.contains("key"), "{text}");
+
+        let after = snapshot(&tmp.raw());
+        assert_eq!(after.len(), rows_before, "a refused open dropped rows");
+        assert_eq!(
+            after, before,
+            "a refused open must not alter a single stored value"
+        );
+
+        // And the data is still there for the key that does exist.
+        let store = tmp.keyed();
+        let got = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(
+            got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            vec!["history", "more history"]
+        );
+    }
+
+    #[test]
+    fn opening_with_a_key_migrates_a_plaintext_database_once() {
+        // More rows than one migration chunk, so the chunked walk is exercised
+        // rather than just its first pass.
+        const ROWS: usize = 600;
+        let tmp = TempDb::new();
+        {
+            let store = tmp.open();
+            store
+                .upsert_room(&Room {
+                    id: "!r:example.org".into(),
+                    name: "Plaintext Room".into(),
+                    encrypted: true,
+                    unread: 1,
+                    last_ts: 5,
+                    last_preview: "old preview".into(),
+                })
+                .expect("upsert room");
+            for i in 0..ROWS {
+                store
+                    .insert_message(&msg(
+                        &format!("$e{i:04}"),
+                        i as u64,
+                        &format!("legacy body {i}"),
+                        true,
+                    ))
+                    .expect("insert");
+            }
+            store
+                .insert_message(&retryable("$pending", 9999))
+                .expect("insert retryable");
+            store.save_session(&sample_session()).expect("session");
+            store.set_meta("pickle_key", "PICKLE").expect("pickle key");
+            store.set_meta("backup_key", "BACKUP").expect("backup key");
+            store
+                .set_meta("sync_token", "s_before")
+                .expect("sync token");
+
+            assert!(
+                store.get_meta(ENCRYPTED_FLAG).expect("flag").is_none(),
+                "an unencrypted store must not claim to be encrypted"
+            );
+            let raw = tmp.raw();
+            assert_eq!(raw_body(&raw, "$e0000"), "legacy body 0");
+        }
+
+        let store = tmp.keyed();
+
+        // Everything still reads, through every accessor.
+        let msgs = store
+            .recent_messages("!r:example.org", 1000)
+            .expect("recent");
+        assert_eq!(msgs.len(), ROWS + 1);
+        assert_eq!(msgs[0].body, "legacy body 0");
+        assert_eq!(msgs[ROWS - 1].body, format!("legacy body {}", ROWS - 1));
+        assert_eq!(
+            store
+                .get_room("!r:example.org")
+                .expect("get room")
+                .expect("room present")
+                .name,
+            "Plaintext Room"
+        );
+        assert_eq!(
+            store.list_rooms().expect("list")[0].last_preview,
+            "old preview"
+        );
+        assert_eq!(
+            store
+                .load_session()
+                .expect("load")
+                .expect("present")
+                .access_token,
+            "syt_supersecret_token"
+        );
+        assert_eq!(
+            store.get_meta("pickle_key").expect("get").as_deref(),
+            Some("PICKLE")
+        );
+        assert_eq!(
+            store.get_meta("backup_key").expect("get").as_deref(),
+            Some("BACKUP")
+        );
+        assert_eq!(
+            store.get_meta("sync_token").expect("get").as_deref(),
+            Some("s_before")
+        );
+        assert_eq!(
+            store
+                .undecrypted_in_room("!r:example.org", 10)
+                .expect("pending"),
+            vec![(
+                "$pending".to_string(),
+                "S-$pending".to_string(),
+                "C-$pending".to_string()
+            )]
+        );
+
+        // And it is all stored encrypted now, with the flag set.
+        let raw = tmp.raw();
+        assert_sealed(
+            &raw_body(&raw, "$e0000"),
+            "legacy body 0",
+            "migrated message.body",
+        );
+        assert_sealed(
+            &raw_body(&raw, &format!("$e{:04}", ROWS - 1)),
+            &format!("legacy body {}", ROWS - 1),
+            "migrated message.body beyond the first chunk",
+        );
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT ciphertext FROM message WHERE event_id = ?1",
+                "$pending",
+            ),
+            "C-$pending",
+            "migrated message.ciphertext",
+        );
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT name FROM room WHERE id = ?1",
+                "!r:example.org",
+            ),
+            "Plaintext Room",
+            "migrated room.name",
+        );
+        assert_sealed(
+            &raw_cell(
+                &raw,
+                "SELECT last_preview FROM room WHERE id = ?1",
+                "!r:example.org",
+            ),
+            "old preview",
+            "migrated room.last_preview",
+        );
+        assert_sealed(
+            &raw_meta(&raw, SESSION_KEY),
+            "syt_supersecret_token",
+            "migrated meta.session",
+        );
+        assert_eq!(
+            raw_meta(&raw, "sync_token"),
+            "s_before",
+            "the migration must not sweep up the non-secret meta keys"
+        );
+        assert_eq!(raw_meta(&raw, ENCRYPTED_FLAG), "1");
+
+        // Reopening is a no-op. Byte-identical blobs is the strong form of
+        // that: re-encrypting would have drawn fresh salts and changed them.
+        let before = snapshot(&raw);
+        drop(store);
+        let store = tmp.keyed();
+        assert_eq!(
+            snapshot(&tmp.raw()),
+            before,
+            "a second open re-encrypted values that were already encrypted"
+        );
+        assert_eq!(
+            store
+                .recent_messages("!r:example.org", 1000)
+                .expect("recent after reopen")
+                .len(),
+            ROWS + 1
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_values_read_straight_through() {
+        // The unit of the rule, both ways round: no prefix means plaintext,
+        // with or without a key.
+        assert_eq!(
+            unseal(None, "message.body", "no prefix here".to_string()).expect("keyless"),
+            "no prefix here"
+        );
+        assert_eq!(
+            unseal(Some(&KEY_A), "message.body", "no prefix here".to_string()).expect("keyed"),
+            "no prefix here"
+        );
+
+        // And in place: a row as an older build left it, sitting in a database
+        // that is otherwise encrypted. This is the half-migrated shape, and it
+        // must read through rather than error or come back as ciphertext.
+        let tmp = TempDb::new();
+        let store = tmp.keyed();
+        store
+            .insert_message(&msg("$sealed", 10, "sealed", true))
+            .expect("insert");
+        tmp.raw()
+            .execute(
+                "INSERT INTO message
+                     (event_id, room, sender, ts, body, encrypted, decrypted, mine,
+                      session_id, ciphertext)
+                 VALUES ('$legacy', '!r:example.org', '@bob:example.org', 20,
+                         'written before the key existed', 0, 1, 0, NULL, NULL)",
+                [],
+            )
+            .expect("insert legacy row");
+        tmp.raw()
+            .execute(
+                "INSERT INTO room (id, name, encrypted, unread, last_ts, last_preview)
+                 VALUES ('!legacy:example.org', 'Old Name', 0, 0, 1, 'old preview')",
+                [],
+            )
+            .expect("insert legacy room");
+
+        let got = store.recent_messages("!r:example.org", 50).expect("recent");
+        assert_eq!(
+            got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            vec!["sealed", "written before the key existed"]
+        );
+        let legacy = store
+            .get_room("!legacy:example.org")
+            .expect("get legacy room")
+            .expect("legacy room present");
+        assert_eq!(legacy.name, "Old Name");
+        assert_eq!(legacy.last_preview, "old preview");
     }
 }

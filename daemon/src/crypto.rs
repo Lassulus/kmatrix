@@ -2140,7 +2140,7 @@ mod tests {
         }
 
         fn open(&self) -> Store {
-            match Store::open(&self.path) {
+            match Store::open(&self.path, None) {
                 Ok(s) => s,
                 Err(e) => panic!("open test store: {e:#}"),
             }

@@ -22,7 +22,14 @@ ureq = { version = "3", features = ["rustls"] }
 # can therefore forge backup entries. Sessions imported from backup are lower
 # provenance than keys received over Olm; we still validate the recovery key
 # against the advertised public key so a server cannot swap the whole backup.
-vodozemac = { version = "0.10", features = ["insecure-pk-encryption"] }
+vodozemac = { version = "0.10", features = [
+    "insecure-pk-encryption",
+    # `low-level-api` exposes vodozemac::hazmat::{Cipher, Mac} (AES-256-CBC +
+    # HMAC-SHA256 with HKDF key derivation). Used to encrypt the on-device
+    # store, whose database lives on the USB-exported partition while its key
+    # does not. Reusing a vetted primitive beats hand-rolling one.
+    "low-level-api",
+] }
 
 [profile.release]
 opt-level = "z"

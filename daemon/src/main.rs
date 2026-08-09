@@ -128,18 +128,94 @@ fn main() {
     }
 }
 
+/// Internal partition holding the store key. On a Kindle `/mnt/us` is the
+/// USB mass-storage volume — plug the device into any computer and the whole
+/// database reads out — whereas `/var/local` is a separate ext3 partition
+/// (`/dev/mmcblk0p9`) that USB does not expose.
+const DEFAULT_KEY_DIR: &str = "/var/local/kmatrix";
+
+/// Load the store encryption key, creating one on first run.
+///
+/// Returns `None` only when encryption is explicitly disabled, in which case
+/// the store is kept in the clear. A key that cannot be created is fatal
+/// rather than a silent downgrade: quietly writing an unprotected database
+/// full of message text and access tokens is exactly the failure this guards
+/// against.
+fn load_or_create_store_key(key_dir: Option<&std::path::Path>) -> Result<Option<[u8; 32]>> {
+    let dir = match key_dir {
+        // `--no-encryption`
+        Some(p) if p.as_os_str().is_empty() => {
+            eprintln!("kmatrixd: WARNING: encryption disabled, the store is readable by anyone");
+            return Ok(None);
+        }
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(DEFAULT_KEY_DIR),
+    };
+    let path = dir.join("store.key");
+
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "store key {} is {} bytes, expected 32 — refusing to continue rather than \
+                     risk making the database unreadable",
+                    path.display(),
+                    bytes.len()
+                )
+            })?;
+            Ok(Some(key))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating key dir {}", dir.display()))?;
+            let mut key = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+
+            let tmp = dir.join("store.key.tmp");
+            std::fs::write(&tmp, key).with_context(|| format!("writing {}", tmp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("chmod {}", tmp.display()))?;
+            }
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("installing {}", path.display()))?;
+            eprintln!("kmatrixd: created store key at {}", path.display());
+            Ok(Some(key))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading store key {}", path.display())),
+    }
+}
+
 fn run() -> Result<()> {
     let mut data_dir: Option<PathBuf> = None;
+    let mut key_dir: Option<PathBuf> = None;
+    let mut reset_store = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--data-dir" => data_dir = args.next().map(PathBuf::from),
+            "--key-dir" => key_dir = args.next().map(PathBuf::from),
+            "--no-encryption" => key_dir = Some(PathBuf::new()),
+            "--reset-store" => reset_store = true,
             "--version" => {
                 println!("{CLIENT_VERSION}");
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("usage: kmatrixd --data-dir <dir>");
+                println!(
+                    "usage: kmatrixd --data-dir <dir> [--key-dir <dir>]\n\
+                     [--no-encryption] [--reset-store]\n\
+                     \n\
+                     The database holds message text and access tokens, and on a Kindle\n\
+                     --data-dir sits on the USB-exported partition. The store is therefore\n\
+                     encrypted with a key kept in --key-dir, which defaults to\n\
+                     {DEFAULT_KEY_DIR} -- a separate internal partition that USB does not\n\
+                     expose. --no-encryption opts out and stores everything in the clear.\n\
+                     --reset-store deletes the database, for when the key is gone and the\n\
+                     data can no longer be read; you will have to log in again."
+                );
                 return Ok(());
             }
             other => return Err(anyhow!("unknown argument: {other}")),
@@ -149,8 +225,33 @@ fn run() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
-    let store = Store::open(&data_dir.join("kmatrix.sqlite3")).context("opening store")?;
-    let session = store.load_session().context("loading session")?;
+    let db_path = data_dir.join("kmatrix.sqlite3");
+    if reset_store {
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            match std::fs::remove_file(&p) {
+                Ok(()) => eprintln!("kmatrixd: removed {}", p.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+            }
+        }
+    }
+
+    let key = load_or_create_store_key(key_dir.as_deref())?;
+    // Both the open and the first read can fail on a key mismatch, and the
+    // way out is the same either way, so they share one explanation.
+    let opened = Store::open(&db_path, key).and_then(|s| {
+        let session = s.load_session()?;
+        Ok((s, session))
+    });
+    let (store, session) = opened.map_err(|e| {
+        anyhow!(
+            "{e:#}\n\nIf the store key was lost (a factory reset or a wiped /var/local \
+             will do it) the database cannot be recovered. Start over with:\n  \
+             kmatrixd --data-dir {} --reset-store\nYou will need to log in again.",
+            data_dir.display()
+        )
+    })?;
 
     let shared = Arc::new(Shared {
         db: Mutex::new(store),

@@ -100,6 +100,35 @@ Restart KOReader. The plugin launches
 `kmatrixd --data-dir /mnt/us/koreader/kmatrix` on demand; the daemon keeps
 `kmatrix.port`, `kmatrix.log` and `kmatrix.sqlite3` in that directory.
 
+### Data at rest
+
+On a Kindle the KOReader directory lives on `/mnt/us`, which is the USB
+mass-storage volume: plug the device into any computer and every file reads
+out, no jailbreak and no authentication. The database holds message text,
+room names, the access token and the key-backup private key.
+
+So the store is encrypted, and the key is kept somewhere USB cannot reach —
+`/var/local/kmatrix/store.key`, mode 0600, on `/dev/mmcblk0p9`, a separate
+internal partition. Override with `--key-dir`, or opt out with
+`--no-encryption`.
+
+Encrypted: message bodies and retained ciphertext, room names and previews,
+the access token, the key-backup key, and the pickle key (so the Olm/Megolm
+pickles are protected transitively). Each value carries a fresh 16-byte salt
+and is keyed by `master || salt` through vodozemac's `Cipher`, whose HKDF
+gives every value its own AES key, MAC key and IV; the 32-byte HMAC is
+verified before decrypting.
+
+**Not** encrypted, and worth being clear about: event ids, room ids, senders
+and timestamps. Message *contents* are protected; the *metadata* of who you
+talk to and when is not. This defends against someone with a USB cable, not
+against someone with a root shell — the key is readable by root on the
+device.
+
+An existing plaintext database is migrated in place on first run (~12 s for
+12k messages on a PW5). If the key is ever lost, the data cannot be
+recovered; `--reset-store` deletes the database so you can log in again.
+
 ## Testing
 
 `scripts/testserver.sh` runs a local `matrix-conduit` on
