@@ -183,9 +183,9 @@ impl Api {
         });
         // Name the base we actually dialled. Discovery may have redirected us,
         // and a mistyped homeserver surfaces here as an opaque TLS or DNS
-        // error -- on a device with a LAN search domain, `lassulus` silently
-        // becomes `lassulus.<search-domain>`, and "certificate not valid" is
-        // not an obvious way to be told you dropped a dot.
+        // error -- on a device with a LAN search domain, a bare `matrix`
+        // silently becomes `matrix.<search-domain>`, and "certificate not
+        // valid" is not an obvious way to be told you dropped a dot.
         let res = self
             .post(&self.url("/_matrix/client/v3/login"))?
             .content_type("application/json")
