@@ -175,3 +175,7 @@ plugin/    kmatrix.koplugin, Lua
 scripts/   testserver.sh, package.sh, ipctest.lua
 PROTOCOL.md  daemon <-> plugin IPC contract
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
