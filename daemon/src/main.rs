@@ -19,7 +19,7 @@ mod ipc;
 mod model;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -60,11 +60,20 @@ const NAME_BATCH: usize = 25;
 
 /// Bumped whenever the naming rules change, so the sweep runs again over
 /// rooms it has already seen and corrects names derived under the old rules.
-const NAME_SCHEMA: &str = "2";
+const NAME_SCHEMA: &str = "6";
 
 /// Sender profiles looked up when a room is opened. Bounded so opening a
 /// room with a long unnamed cast costs a few small requests, not hundreds.
 const SENDER_LOOKUPS: usize = 8;
+
+/// One-to-one chats a user must appear in, beside a counterpart already named
+/// by `m.direct`, before being treated as the bridge's own rather than as
+/// someone you talk to. Two could be coincidence between mutual contacts.
+const BRIDGE_UBIQUITY: usize = 3;
+
+/// Distinct speakers below which a room we have never inspected is treated as
+/// a small chat worth naming after its members. Bridge portals have two.
+const SMALL_ROOM: usize = 8;
 
 /// Members listed in a computed room name before the rest become "and N
 /// others". Matches the cap the server applies to `m.heroes`.
@@ -364,21 +373,64 @@ fn name_from_heroes(jr: &JoinedRoom) -> Option<String> {
 /// Name a room from the full joined-member list, for rooms the server never
 /// sent a summary for. Same output as the hero path: the first few members,
 /// then a count of everyone else.
-fn name_from_members(me: &str, joined: &BTreeMap<String, Option<String>>) -> Option<String> {
-    let members = joined.len() as u32;
-    let names: Vec<String> = joined
-        .iter()
-        .filter(|(user_id, _)| user_id.as_str() != me)
-        .take(HERO_CAP)
-        .map(|(user_id, display)| match display.as_deref() {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => localpart(user_id).to_string(),
-        })
+///
+/// `skip` drops the bridge's own users, without which every bridged chat is
+/// named after us and a bot as much as after the person.
+fn name_from_members(
+    me: &str,
+    joined: &BTreeMap<String, Option<String>>,
+    skip: &BTreeSet<String>,
+) -> Option<String> {
+    let people: Vec<&String> = joined
+        .keys()
+        .filter(|u| u.as_str() != me && !skip.contains(*u))
         .collect();
-    if names.is_empty() {
-        return (members <= 1).then(|| "Empty room".to_string());
+    // A room of nothing but bridge users is still a room; name it after
+    // everyone rather than call it empty.
+    let people: Vec<&String> = if people.is_empty() {
+        joined.keys().filter(|u| u.as_str() != me).collect()
+    } else {
+        people
+    };
+    if people.is_empty() {
+        return (joined.len() <= 1).then(|| "Empty room".to_string());
     }
-    Some(compose_name(&names, members))
+    let counted = people.len() as u32 + 1;
+    let names: Vec<String> = people
+        .iter()
+        .take(HERO_CAP)
+        .map(|user_id| person_name(user_id, joined))
+        .collect();
+    Some(compose_name(&names, counted))
+}
+
+/// Users who turn up in one-to-one chats without being the other person:
+/// our own bridge ghosts and the bridge bots.
+///
+/// A Signal portal holds the contact's ghost, ours, and the bot, so its
+/// member list reads "me, them, Signal Bridge Bot". Nothing in the protocol
+/// marks which is which, and the bridge does not record every portal in
+/// `m.direct` — but across the chats it does record, the same few users
+/// appear beside a counterpart that is already known. Those are the ones.
+fn bridge_users(db: &Store, me: &str, counterpart: &BTreeMap<&str, &str>) -> BTreeSet<String> {
+    let partners: BTreeSet<&str> = counterpart.values().copied().collect();
+    let mut seen_in: BTreeMap<String, usize> = BTreeMap::new();
+    for (room, partner) in counterpart {
+        let Ok(ids) = db.member_ids(room) else {
+            continue;
+        };
+        for id in ids {
+            if id == me || id == *partner || partners.contains(id.as_str()) {
+                continue;
+            }
+            *seen_in.entry(id).or_default() += 1;
+        }
+    }
+    seen_in
+        .into_iter()
+        .filter(|(_, rooms)| *rooms >= BRIDGE_UBIQUITY)
+        .map(|(user, _)| user)
+        .collect()
 }
 
 /// "alice, bob and 4 others" — the listed names, then whoever is left once
@@ -696,17 +748,39 @@ fn process_sync(
 ///
 /// Returns the number renamed and whether the sweep has reached the end.
 fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(usize, bool)> {
-    let direct = api.direct_rooms(me).unwrap_or_default();
+    // Without this every bridged chat would be named after its cast list, so
+    // a pass that cannot read it must make no progress at all rather than
+    // write names it would only have to correct later.
+    let direct = match api.direct_rooms(me) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("kmatrixd: m.direct: {e:#}");
+            return Ok((0, false));
+        }
+    };
     let mut counterpart: BTreeMap<&str, &str> = BTreeMap::new();
     for (user, rooms) in &direct {
         for room in rooms {
             counterpart.entry(room.as_str()).or_insert(user.as_str());
         }
     }
+    if !counterpart.is_empty() {
+        eprintln!("kmatrixd: {} direct chat(s) known", counterpart.len());
+    }
 
-    let (batch, done) = {
+    let (batch, done, bridge) = {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        let cursor = db.get_meta("room_names_cursor")?.unwrap_or_default();
+        let bridge = bridge_users(&db, me, &counterpart);
+        // The cursor carries the rules it was recorded under: a new schema
+        // must re-walk the whole list, not resume where the old one stopped.
+        let cursor = db
+            .get_meta("room_names_cursor")?
+            .and_then(|v| {
+                v.strip_prefix(NAME_SCHEMA)
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
         let mut rooms: Vec<Room> = db
             .list_rooms()?
             .into_iter()
@@ -715,24 +789,58 @@ fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(us
         rooms.sort_by(|a, b| a.id.cmp(&b.id));
         let done = rooms.len() <= NAME_BATCH;
         rooms.truncate(NAME_BATCH);
-        (rooms, done)
+        (rooms, done, bridge)
     };
 
     let mut renamed = 0usize;
     let mut reached = None;
+    // A lookup that fails is almost always the radio, not the room: an
+    // e-reader spends most of its life asleep with the wifi down. Stopping
+    // leaves the cursor on the last room actually dealt with, so the sweep
+    // resumes there instead of marching to the end having named nothing.
+    let mut offline = false;
     for room in &batch {
-        reached = Some(room.id.clone());
         let partner = counterpart.get(room.id.as_str()).copied();
-        // Nothing to learn about a room that is already named and is not a
-        // direct chat, so it costs no request.
-        if room.name != room.id && partner.is_none() {
+        let (known_members, spoke) = {
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            (
+                !db.member_ids(&room.id)?.is_empty(),
+                db.distinct_senders(&room.id)?,
+            )
+        };
+        // Worth asking about if it has no name, if it is a direct chat, or if
+        // it is a small room we have never looked at — the last catches the
+        // bridge portals the bridge forgot to record in `m.direct`. A room a
+        // crowd talks in is left alone: naming it would mean pulling a
+        // membership list of thousands to render five.
+        let consider =
+            room.name == room.id || partner.is_some() || (!known_members && spoke <= SMALL_ROOM);
+        if !consider {
+            reached = Some(room.id.clone());
             continue;
         }
+
+        // A name the room carries outranks anything we compute. Asking beats
+        // trying to tell, from the stored string alone, whether an earlier
+        // pass took it from the server or built it from the members.
+        let given = if room.name == room.id {
+            None
+        } else {
+            match api.room_name(&room.id) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("kmatrixd: naming {}: {e:#}", room.id);
+                    offline = true;
+                    break;
+                }
+            }
+        };
         let members = match api.member_names(&room.id) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("kmatrixd: naming {}: {e:#}", room.id);
-                continue;
+                offline = true;
+                break;
             }
         };
         {
@@ -741,16 +849,17 @@ fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(us
             let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
             db.remember_members(&room.id, &members)?;
         }
-        let from_members = name_from_members(me, &members);
-        let wanted = match partner {
-            Some(user) => Some(person_name(user, &members)),
-            None => from_members.clone(),
+        reached = Some(room.id.clone());
+
+        let wanted = match (given, partner) {
+            (Some(given), _) => given,
+            (None, Some(user)) => person_name(user, &members),
+            (None, None) => match name_from_members(me, &members, &bridge) {
+                Some(n) => n,
+                None => continue,
+            },
         };
-        let Some(wanted) = wanted else { continue };
-        // Only ever replace a name we derived ourselves. Anything else came
-        // from `m.room.name` or a canonical alias and the server means it.
-        let ours = room.name == room.id || Some(&room.name) == from_members.as_ref();
-        if !ours || room.name == wanted {
+        if room.name == wanted {
             continue;
         }
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
@@ -762,10 +871,11 @@ fn backfill_room_names(sh: &Arc<Shared>, api: &Arc<Api>, me: &str) -> Result<(us
         renamed += 1;
     }
 
+    let done = done && !offline;
     {
         let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
         if let Some(reached) = reached {
-            db.set_meta("room_names_cursor", &reached)?;
+            db.set_meta("room_names_cursor", &format!("{NAME_SCHEMA}:{reached}"))?;
         }
         if done {
             db.set_meta("room_names_schema", NAME_SCHEMA)?;
@@ -1706,6 +1816,10 @@ mod tests {
             .collect()
     }
 
+    fn nobody() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     #[test]
     fn names_a_room_after_everyone_but_us() {
         let m = members(&[
@@ -1715,7 +1829,7 @@ mod tests {
         ]);
         // Display name where the server has one, localpart where it does not.
         assert_eq!(
-            name_from_members("@me:h", &m).as_deref(),
+            name_from_members("@me:h", &m, &nobody()).as_deref(),
             Some("Alice, bob")
         );
     }
@@ -1724,7 +1838,7 @@ mod tests {
     fn a_room_containing_only_us_is_empty() {
         let m = members(&[("@me:h", Some("Me"))]);
         assert_eq!(
-            name_from_members("@me:h", &m).as_deref(),
+            name_from_members("@me:h", &m, &nobody()).as_deref(),
             Some("Empty room")
         );
     }
@@ -1737,8 +1851,40 @@ mod tests {
         let m: BTreeMap<_, _> = pairs.into_iter().collect();
         // Five named, thirteen members, ourselves excluded: seven left.
         assert_eq!(
-            name_from_members("@me:h", &m).as_deref(),
+            name_from_members("@me:h", &m, &nobody()).as_deref(),
             Some("u00, u01, u02, u03, u04 and 7 others")
+        );
+    }
+
+    #[test]
+    fn a_bridged_chat_is_named_after_the_person_not_the_plumbing() {
+        // What a Signal portal actually holds.
+        let m = members(&[
+            ("@lassulus:h", Some("me")),
+            ("@signal_aaa:h", Some("lassulus (S)")),
+            ("@signal_bbb:h", Some("Oliver Habryka (S)")),
+            ("@signalbot:h", Some("Signal Bridge Bot")),
+        ]);
+        let bridge: BTreeSet<String> = ["@signal_aaa:h", "@signalbot:h"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            name_from_members("@lassulus:h", &m, &bridge).as_deref(),
+            Some("Oliver Habryka (S)"),
+            "our own ghost and the bot are not who the chat is with"
+        );
+    }
+
+    #[test]
+    fn a_room_of_nothing_but_bridge_users_still_gets_a_name() {
+        // Excluding everyone would leave nothing to call it; the plumbing is
+        // a worse name than the person, but it beats "Empty room".
+        let m = members(&[("@me:h", Some("Me")), ("@signalbot:h", Some("Bot"))]);
+        let bridge: BTreeSet<String> = ["@signalbot:h".to_string()].into_iter().collect();
+        assert_eq!(
+            name_from_members("@me:h", &m, &bridge).as_deref(),
+            Some("Bot")
         );
     }
 }

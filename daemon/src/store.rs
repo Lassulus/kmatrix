@@ -884,6 +884,41 @@ impl Store {
             .with_context(|| format!("commit member update for {room}"))
     }
 
+    /// Who a room holds, ids only. No name is decrypted: the caller is asking
+    /// about the shape of the membership, not about people.
+    pub fn member_ids(&self, room: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT user_id FROM member WHERE room = ?1")
+            .context("prepare member id query")?;
+        let rows = stmt
+            .query_map(params![room], |row| row.get::<_, String>(0))
+            .with_context(|| format!("query members of {room}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("read member id")?);
+        }
+        Ok(out)
+    }
+
+    /// How many distinct people have spoken in a room.
+    ///
+    /// A cheap local stand-in for "is this a small chat": pulling the whole
+    /// membership of a room to name it is fine for a two-person bridge portal
+    /// and ruinous for a public room with ten thousand members, and nothing
+    /// we have already stored says which is which.
+    pub fn distinct_senders(&self, room: &str) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT sender) FROM message WHERE room = ?1",
+                params![room],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("count senders in {room}"))?;
+        Ok(n as usize)
+    }
+
     // -------------------------------------------------------------- pickles
 
     pub fn put_pickle(&self, kind: &str, id: &str, extra: &str, pickle: &str) -> Result<()> {

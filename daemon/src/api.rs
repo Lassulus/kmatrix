@@ -115,6 +115,12 @@ struct DisplayNameResponse {
 }
 
 #[derive(Deserialize)]
+struct RoomNameResponse {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MatrixError {
     errcode: Option<String>,
     error: Option<String>,
@@ -280,6 +286,26 @@ impl Api {
         }
         let parsed: DisplayNameResponse = finish(res, "profile displayname")?;
         Ok(parsed.displayname.filter(|n| !n.is_empty()))
+    }
+
+    /// The room's own `m.room.name`, if it has one.
+    ///
+    /// Asked for a direct chat before naming it after the person, because a
+    /// name the room carries outranks one we compute. Checking is cheaper and
+    /// surer than trying to recognise, from the stored string alone, whether
+    /// an earlier pass took it from the server or built it from the members.
+    /// A room without a name answers 404.
+    pub fn room_name(&self, room: &str) -> Result<Option<String>> {
+        let url = self.url(&format!(
+            "/_matrix/client/v3/rooms/{}/state/m.room.name",
+            encode_segment(room)
+        ));
+        let res = self.get_auth(&url)?.call()?;
+        if res.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let parsed: RoomNameResponse = finish(res, "room name")?;
+        Ok(parsed.name.filter(|n| !n.is_empty()))
     }
 
     /// Long-poll `/sync`.
