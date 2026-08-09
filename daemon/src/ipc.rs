@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
@@ -17,6 +18,10 @@ use serde_json::json;
 
 use crate::model::*;
 use crate::Shared;
+
+/// How long a single event write may take before the subscriber is dropped.
+/// Generous for an e-reader mid-repaint, far short of forever.
+const BUS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fan-out of unsolicited events to every authenticated client.
 pub struct Bus {
@@ -31,6 +36,13 @@ impl Bus {
     }
 
     fn add(&self, s: TcpStream) {
+        // A subscriber that stops reading must not be able to stop the
+        // daemon. Without a deadline, one client whose socket buffer has
+        // filled blocks `publish` forever, and it blocks holding the client
+        // list, so every later event and every request behind it stops too.
+        // Missing events is recoverable -- the plugin re-reads state on
+        // reconnect -- and a wedged daemon is not.
+        let _ = s.set_write_timeout(Some(BUS_WRITE_TIMEOUT));
         if let Ok(mut v) = self.clients.lock() {
             v.push(s);
         }
@@ -46,6 +58,11 @@ impl Bus {
             return;
         };
         v.retain_mut(|c| c.write_all(line.as_bytes()).and_then(|_| c.flush()).is_ok());
+    }
+
+    #[cfg(test)]
+    fn subscribers(&self) -> usize {
+        self.clients.lock().map(|v| v.len()).unwrap_or(0)
     }
 }
 
@@ -330,6 +347,42 @@ mod tests {
     use crate::{NetState, Shared, Status};
     use std::sync::atomic::AtomicBool;
     use std::sync::Condvar;
+
+    /// A client that stops reading fills its socket buffer. The daemon must
+    /// drop it, not block in `write_all` -- and it blocks holding the client
+    /// list, so one dead subscriber otherwise stops every later event and
+    /// every request queued behind them. Observed on the device: `hello`
+    /// still answered while `rooms` never did, with all threads asleep.
+    #[test]
+    fn a_subscriber_that_stops_reading_is_dropped_not_waited_for() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let _client = TcpStream::connect(addr).expect("connect"); // never reads
+        let (server, _) = listener.accept().expect("accept");
+        let same_socket = server.try_clone().expect("clone");
+
+        let bus = Bus::new();
+        bus.add(server);
+        assert!(
+            same_socket.write_timeout().expect("timeout").is_some(),
+            "writes to a subscriber must be bounded"
+        );
+        // Shorten the deadline so the test does not sit out the real one.
+        same_socket
+            .set_write_timeout(Some(Duration::from_millis(50)))
+            .expect("shorten");
+
+        let event = json!({ "event": "messages", "pad": "x".repeat(64 * 1024) });
+        let start = std::time::Instant::now();
+        for _ in 0..256 {
+            bus.publish(&event);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "publish blocked on a client that never reads"
+        );
+        assert_eq!(bus.subscribers(), 0, "the stuck client must be dropped");
+    }
 
     fn shared(dir: &std::path::Path) -> Arc<Shared> {
         let store = crate::store::Store::open(&dir.join("s.db"), None).expect("open store");
