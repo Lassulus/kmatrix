@@ -254,6 +254,28 @@ function KMatrix:teardownConnection()
     end
 end
 
+--- Whether any Matrix screen is still on show.
+function KMatrix:uiVisible()
+    return self.room_menu ~= nil or self.timeline ~= nil
+end
+
+--- Called when one of our screens closes: if it was the last, drop the
+-- connection, which is what tells the daemon to exit.
+--
+-- The daemon syncs for a screen, so it should not outlive one. Reading a book
+-- with Matrix opened an hour ago is not reading Matrix.
+--
+-- Deferred a tick because a close is not always a departure: leaving a room
+-- puts the room list back in front, and the check has to run after whatever
+-- comes next has had its chance to open.
+function KMatrix:releaseIfHidden()
+    UIManager:nextTick(function()
+        if self:uiVisible() or not self:isConnected() then return end
+        logger.dbg("kmatrix: last screen closed, releasing the daemon")
+        self:teardownConnection()
+    end)
+end
+
 function KMatrix:onDaemonDisconnect(err)
     -- We are called from inside UIManager's ZMQ iteration; mutating the ZMQ
     -- list right now would confuse it, so defer the cleanup by one tick.
@@ -694,6 +716,7 @@ function KMatrix:showRoomList()
         end,
         close_callback = function()
             self.room_menu = nil
+            self:releaseIfHidden()
         end,
     }
     -- Whole screen changes: this is the one place a partial refresh is right.
@@ -847,6 +870,7 @@ function KMatrix:openTimeline(room_id, room_name)
         end,
         close_callback = function()
             self.timeline = nil
+            self:releaseIfHidden()
         end,
     }
     self.timeline.menu = menu

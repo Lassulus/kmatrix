@@ -88,6 +88,24 @@
         tarball = pkgs.runCommand "kmatrix-${version}-armv7.tar.gz" { } ''
           tar -czf "$out" -C ${bundle} --owner=0 --group=0 kmatrix kmatrix.koplugin
         '';
+
+        # Headless regression test for the plugin: it loads the real main.lua
+        # with the whole KOReader layer stubbed, so it needs neither a daemon
+        # nor a network nor a device -- only luajit, the interpreter the
+        # devices actually run. Laid out as a checkout so the script finds the
+        # plugin next to itself, the same way it does in a working tree.
+        plugintest =
+          pkgs.runCommand "kmatrix-plugintest"
+            {
+              nativeBuildInputs = [ pkgs.luajit ];
+            }
+            ''
+              set -o pipefail
+              mkdir -p src/scripts src/plugin
+              cp ${./scripts/plugintest.lua} src/scripts/plugintest.lua
+              cp -r ${./plugin/kmatrix.koplugin} src/plugin/kmatrix.koplugin
+              luajit src/scripts/plugintest.lua 2>&1 | tee "$out"
+            '';
       in
       {
         packages = {
@@ -100,6 +118,11 @@
           type = "app";
           program = "${kmatrixd}/bin/kmatrixd";
         };
+
+        checks = {
+          inherit plugintest;
+        };
+
         # `nix fmt` hands the formatter bare paths, including directories and
         # non-Nix files, which nixfmt itself rejects. Fan out to *.nix and run
         # shfmt over the scripts in the same pass.
