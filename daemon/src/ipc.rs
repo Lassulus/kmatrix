@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,17 +25,20 @@ const BUS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fan-out of unsolicited events to every authenticated client.
 pub struct Bus {
-    clients: Mutex<Vec<TcpStream>>,
+    clients: Mutex<Vec<(u64, TcpStream)>>,
+    next_id: AtomicU64,
 }
 
 impl Bus {
     pub fn new() -> Bus {
         Bus {
             clients: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(1),
         }
     }
 
-    fn add(&self, s: TcpStream) {
+    /// Register a subscriber, returning the handle that removes it again.
+    fn add(&self, s: TcpStream) -> u64 {
         // A subscriber that stops reading must not be able to stop the
         // daemon. Without a deadline, one client whose socket buffer has
         // filled blocks `publish` forever, and it blocks holding the client
@@ -43,9 +46,25 @@ impl Bus {
         // Missing events is recoverable -- the plugin re-reads state on
         // reconnect -- and a wedged daemon is not.
         let _ = s.set_write_timeout(Some(BUS_WRITE_TIMEOUT));
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut v) = self.clients.lock() {
-            v.push(s);
+            v.push((id, s));
         }
+        id
+    }
+
+    /// Drop one subscriber by handle and report how many are left.
+    ///
+    /// `publish` also drops clients, but only the ones whose write fails, and
+    /// only when there is something to send. A reader who put the device down
+    /// has to be counted out the moment their socket closes, because that
+    /// count is what decides the daemon is done.
+    fn remove(&self, id: u64) -> usize {
+        let Ok(mut v) = self.clients.lock() else {
+            return 0;
+        };
+        v.retain(|(held, _)| *held != id);
+        v.len()
     }
 
     /// Write one event line to every client, dropping those that error.
@@ -57,7 +76,7 @@ impl Bus {
         let Ok(mut v) = self.clients.lock() else {
             return;
         };
-        v.retain_mut(|c| c.write_all(line.as_bytes()).and_then(|_| c.flush()).is_ok());
+        v.retain_mut(|(_, c)| c.write_all(line.as_bytes()).and_then(|_| c.flush()).is_ok());
     }
 
     #[cfg(test)]
@@ -134,7 +153,47 @@ pub fn serve(sh: &Arc<Shared>, listener: TcpListener) {
     }
 }
 
+/// Stop the daemon: the sync loop winds down, `serve` leaves its accept loop,
+/// and `run` removes the port file on the way out.
+///
+/// `incoming()` is blocked waiting for a connection and setting the flag does
+/// not wake it, so make the connection it is waiting for.
+fn stop_serving(sh: &Arc<Shared>) {
+    sh.shutdown();
+    if let Some(port) = sh.ipc_port.get().copied() {
+        let _ = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    }
+}
+
+/// Serve one connection, then decide whether the daemon still has a reason to
+/// run.
+///
+/// The daemon exists to serve the plugin. Once the last reader has gone -- the
+/// screen locked, KOReader closed, the app left -- syncing on is spending the
+/// battery of a device whose defining feature is that it sleeps. Nothing is
+/// lost by stopping: the homeserver keeps queued to-device traffic until we
+/// ask for it, and the next run resumes from the stored `next_batch`, which is
+/// exactly what already happens across a night of sleep.
+///
+/// A connection that never authenticated is not a reader: a probe of the port
+/// hanging up must not stop the daemon.
 fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
+    let mut subscription = None;
+    let outcome = client_loop(sh, stream, &mut subscription);
+    if let Some(id) = subscription {
+        if sh.bus.remove(id) == 0 && sh.running.load(Ordering::SeqCst) {
+            eprintln!("kmatrixd: last client disconnected, stopping");
+            stop_serving(sh);
+        }
+    }
+    outcome
+}
+
+fn client_loop(
+    sh: &Arc<Shared>,
+    stream: TcpStream,
+    subscription: &mut Option<u64>,
+) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut writer = stream.try_clone().context("cloning stream")?;
     let reader = BufReader::new(stream);
@@ -176,7 +235,8 @@ fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
                             &mut writer,
                             &json!({"id": env.id, "ok": true, "version": CLIENT_VERSION}),
                         )?;
-                        sh.bus.add(writer.try_clone().context("cloning for bus")?);
+                        *subscription =
+                            Some(sh.bus.add(writer.try_clone().context("cloning for bus")?));
                         continue;
                     }
                     reply(
@@ -199,12 +259,7 @@ fn handle_client(sh: &Arc<Shared>, stream: TcpStream) -> Result<()> {
         reply(&mut writer, &resp)?;
 
         if resp.get("__shutdown").is_some() {
-            sh.shutdown();
-            // `incoming()` blocks until the next connection, so make one.
-            let port = sh.ipc_port.get().copied();
-            if let Some(port) = port {
-                let _ = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-            }
+            stop_serving(sh);
             return Ok(());
         }
     }
@@ -434,6 +489,100 @@ mod tests {
             .expect("get_meta");
         assert!(leaked.is_none(), "IPC token must never be persisted");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drive a real listener through `serve` on a thread, the way `run` does.
+    fn serve_in_background(sh: &Arc<Shared>) -> std::thread::JoinHandle<()> {
+        let listener = listen(sh).expect("listen");
+        let sh2 = Arc::clone(sh);
+        std::thread::spawn(move || serve(&sh2, listener))
+    }
+
+    fn hello(sh: &Arc<Shared>) -> TcpStream {
+        let port = sh.ipc_port.get().copied().expect("port");
+        let mut c = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("dial");
+        let token = sh.ipc_token.get().cloned().expect("token");
+        c.write_all(format!("{{\"id\":1,\"cmd\":\"hello\",\"token\":\"{token}\"}}\n").as_bytes())
+            .expect("write hello");
+        let mut line = String::new();
+        BufReader::new(c.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("read hello reply");
+        assert!(line.contains("\"ok\":true"), "hello refused: {line}");
+        c
+    }
+
+    fn wait_for_stop(sh: &Arc<Shared>, joiner: std::thread::JoinHandle<()>) -> bool {
+        for _ in 0..200 {
+            if joiner.is_finished() {
+                joiner.join().expect("serve panicked");
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        sh.running.load(Ordering::SeqCst);
+        false
+    }
+
+    /// The daemon serves the plugin, so once the last reader hangs up it has
+    /// no reason to keep syncing. On a Kindle that mattered: it used to run
+    /// on across app close and even KOReader restarts, polling the homeserver
+    /// for a screen that was off.
+    #[test]
+    fn the_last_client_leaving_stops_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("kmatrix-idle-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sh = shared(&dir);
+        let joiner = serve_in_background(&sh);
+
+        let first = hello(&sh);
+        let second = hello(&sh);
+
+        // One reader of two leaving is not the last one.
+        drop(first);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            sh.running.load(Ordering::SeqCst),
+            "the daemon stopped while a client was still connected"
+        );
+
+        drop(second);
+        assert!(wait_for_stop(&sh, joiner), "the daemon kept running with nobody connected");
+        assert!(
+            !dir.join("kmatrix.port").exists() || !sh.running.load(Ordering::SeqCst),
+            "the daemon stopped without winding down"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anything may connect to a loopback port. Only a reader that got through
+    /// `hello` counts, or a stray probe could stop the daemon mid-sync.
+    #[test]
+    fn an_unauthenticated_probe_hanging_up_does_not_stop_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("kmatrix-probe-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sh = shared(&dir);
+        let joiner = serve_in_background(&sh);
+
+        let reader = hello(&sh);
+        let port = sh.ipc_port.get().copied().expect("port");
+
+        // A connect-and-vanish, and a wrong token: neither is a reader.
+        drop(TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("probe"));
+        let mut bad = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("dial");
+        bad.write_all(b"{\"id\":1,\"cmd\":\"hello\",\"token\":\"wrong\"}\n")
+            .expect("write");
+        drop(bad);
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            sh.running.load(Ordering::SeqCst),
+            "a probe hanging up stopped the daemon"
+        );
+
+        drop(reader);
+        assert!(wait_for_stop(&sh, joiner), "the real reader leaving did not stop it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
