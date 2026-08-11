@@ -131,6 +131,9 @@ function InfoMessage:new(t)
     return setmetatable(t, { __index = self })
 end
 
+-- Whether the stubbed filesystem can see the data directory at all.
+local data_dir_visible = true
+
 local stubs = {
     ["ui/widget/buttondialog"] = widget(),
     ["ui/font"] = { getFace = function() return {} end },
@@ -169,9 +172,20 @@ local stubs = {
         secondsToHour = function() return "12:00" end,
         secondsToDateTime = function() return "2026-08-08 12:00" end,
     },
-    ["libs/libkoreader-lfs"] = { attributes = function() return nil end },
+    -- The data directory is there and nothing in it is: what a device looks
+    -- like before the daemon is installed. `data_dir_visible` flips it to the
+    -- other case, where /mnt/us itself has gone -- the two the plugin has to
+    -- tell apart.
+    ["libs/libkoreader-lfs"] = {
+        attributes = function(path, what)
+            if what == "mode" and data_dir_visible and path == "/tmp/kmatrix" then
+                return "directory"
+            end
+            return nil
+        end,
+    },
     logger = { dbg = function() end, warn = function() end, info = function() end },
-    util = { trim = function(s) return s end },
+    util = { trim = function(s) return s end, makePath = function() end },
     gettext = setmetatable({}, { __call = function(_self, s) return s end }),
     ["ffi/util"] = {
         template = function(fmt, ...)
@@ -179,7 +193,15 @@ local stubs = {
             return (fmt:gsub("%%(%d)", function(n) return tostring(args[tonumber(n)]) end))
         end,
     },
-    ipc = { dataDir = function() return "/tmp" end },
+    kmatrix_ipc = { dataDir = function() return "/tmp/kmatrix" end },
+    -- A decoy under the name this plugin used to use. Another plugin on the
+    -- device ships its own IPC helper, and Lua's module cache is global: two
+    -- plugins that both `require("ipc")` get whichever loaded first. That is
+    -- not hypothetical -- installing covibe alongside made the Matrix plugin
+    -- read covibe's data directory and report its own daemon missing at
+    -- `.../covibe/kmatrixd`. Requiring a name nobody else uses is the fix,
+    -- and this entry fails the test if anything reaches for the old one.
+    ipc = { dataDir = function() return "/tmp/SOMEONE-ELSES-PLUGIN" end },
 }
 
 -- Ahead of the real searchers, so `require` never reaches KOReader's tree.
@@ -414,6 +436,36 @@ check("closing the last screen releases the daemon",
     km.ipc == nil and ipc_stopped == true, tostring(km.ipc) .. " stopped=" .. tostring(ipc_stopped))
 
 check("releasing twice is harmless", pcall(function() km:releaseIfHidden() end))
+
+--[[ The daemon is looked for in our own directory ]]--
+
+-- Two plugins that both `require("ipc")` share one module: Lua caches modules
+-- by name across the whole interpreter, so whichever plugin loads first wins
+-- for both. Installing covibe beside this one did exactly that, and the Matrix
+-- plugin went looking for its daemon in covibe's data directory and reported
+-- it missing at `.../covibe/kmatrixd`. The stubs register a decoy under the
+-- old shared name; anything that reaches for it shows up in the path below.
+
+km.room_menu = nil
+km.timeline = nil
+local said = #shown
+check("a missing daemon is reported", km:spawnDaemon() == false)
+local complaint = shown[#shown] or ""
+check("the complaint was shown", #shown > said, tostring(#shown))
+check("and it names our own directory, not another plugin's",
+    complaint:find("/tmp/kmatrix/kmatrixd", 1, true) ~= nil, complaint)
+check("nothing reached for the shared `ipc` name",
+    complaint:find("SOMEONE%-ELSES%-PLUGIN") == nil, complaint)
+
+-- And the other half of that message: a volume that is not mounted is not a
+-- daemon that was never installed. On a Kindle everything lives on /mnt/us,
+-- which disappears while the device is plugged into a computer.
+data_dir_visible = false
+check("a vanished data directory is reported too", km:spawnDaemon() == false)
+local gone = shown[#shown] or ""
+check("and it says the directory cannot be seen, not that nothing is installed",
+    gone:find("Cannot see /tmp/kmatrix", 1, true) ~= nil, gone)
+data_dir_visible = true
 
 --[[ Verdict ]]--
 

@@ -22,7 +22,7 @@ end
 package.preload["json"] = function() return require("dkjson") end
 
 package.path = "plugin/kmatrix.koplugin/?.lua;" .. package.path
-local IPC = require("ipc")
+local IPC = require("kmatrix_ipc")
 
 -- --------------------------------------------------------------- helpers
 -- Wall clock, not os.clock(): os.clock() reports CPU time, which barely

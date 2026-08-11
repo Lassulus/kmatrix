@@ -38,7 +38,7 @@ need tar
 
 [ -f "$MANIFEST" ] || die "no daemon manifest at $MANIFEST"
 [ -d "$PLUGIN_SRC" ] || die "plugin sources not found at $PLUGIN_SRC"
-for lua in _meta.lua main.lua ipc.lua; do
+for lua in _meta.lua main.lua kmatrix_ipc.lua; do
 	[ -f "$PLUGIN_SRC/$lua" ] || die "plugin file missing: $PLUGIN_SRC/$lua"
 done
 

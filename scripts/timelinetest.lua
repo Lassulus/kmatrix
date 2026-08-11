@@ -19,7 +19,7 @@ end
 package.preload["json"] = function() return require("dkjson") end
 
 package.path = "plugin/kmatrix.koplugin/?.lua;" .. package.path
-local IPC = require("ipc")
+local IPC = require("kmatrix_ipc")
 local socket = require("socket")
 
 local function poll(client, seconds)

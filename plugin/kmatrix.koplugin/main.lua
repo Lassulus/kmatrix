@@ -11,7 +11,7 @@ UI thread never blocks on the network.
 
 local ButtonDialog = require("ui/widget/buttondialog")
 local Font = require("ui/font")
-local IPC = require("ipc")
+local IPC = require("kmatrix_ipc")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
