@@ -165,12 +165,26 @@ function KMatrix:spawnDaemon()
     util.makePath(dir)
     local binary = dir .. "/kmatrixd"
     if lfs.attributes(binary, "mode") ~= "file" then
-        self:notify(T(_("The Matrix daemon is not installed.\nExpected it at: %1"), binary), 5)
+        -- Say which of the two it is. Everything here lives on /mnt/us, which
+        -- is not there while the Kindle is plugged into a computer, and a
+        -- daemon that is merely out of sight reads as uninstalled -- the same
+        -- message for a missing file and a missing volume sends you looking
+        -- in the wrong place.
+        local seen = lfs.attributes(dir, "mode")
+        logger.warn("kmatrix: cannot launch", binary, "- data dir is", tostring(seen))
+        if seen ~= "directory" then
+            self:notify(T(_("Cannot see %1.\nIf the device is plugged into a computer, unplug it and try again."), dir), 5)
+        else
+            self:notify(T(_("The Matrix daemon is not installed.\nExpected it at: %1"), binary), 5)
+        end
         return false
     end
     local command = string.format("%s --data-dir %s >> %s 2>&1 &",
         shellQuote(binary), shellQuote(dir), shellQuote(dir .. "/kmatrix.log"))
-    logger.dbg("kmatrix: launching daemon:", command)
+    -- Logged at info so that a launch that goes nowhere leaves a trace in
+    -- crash.log: the daemon's own log only exists once it gets as far as
+    -- writing to it.
+    logger.info("kmatrix: launching daemon:", command)
     os.execute(command)
     return true
 end
