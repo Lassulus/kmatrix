@@ -167,6 +167,41 @@ fn main() {
 /// (`/dev/mmcblk0p9`) that USB does not expose.
 const DEFAULT_KEY_DIR: &str = "/var/local/kmatrix";
 
+/// An exclusive lock on the data directory, held for the lifetime of the
+/// process. `flock` is released by the kernel when the process exits by any
+/// route, including a kill, so there is no stale lock to clean up.
+struct InstanceLock {
+    /// The open descriptor *is* the lock: the kernel releases it when this
+    /// closes, so the file is held rather than read.
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn take(dir: &std::path::Path) -> Result<InstanceLock> {
+        let path = dir.join("kmatrix.lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: a plain flock on a descriptor we own.
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(anyhow!(
+                    "another kmatrixd is already running on {}",
+                    dir.display()
+                ));
+            }
+            return Err(err).with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(InstanceLock { _file: f })
+    }
+}
+
 /// Load the store encryption key, creating one on first run.
 ///
 /// Returns `None` only when encryption is explicitly disabled, in which case
@@ -258,6 +293,14 @@ fn run() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
+    // One daemon per data directory. Two of them share a store, both sync the
+    // same account, and -- since a daemon exits with its last client and takes
+    // the port file with it -- the second one to leave deletes the port file
+    // the first one is still listening behind, which leaves a live daemon
+    // nothing can find. The lock is held for as long as the process runs and
+    // released by the kernel however it dies, so a crash cannot wedge it.
+    let _instance = InstanceLock::take(&data_dir)?;
+
     let db_path = data_dir.join("kmatrix.sqlite3");
     if reset_store {
         for suffix in ["", "-wal", "-shm"] {
@@ -348,7 +391,7 @@ fn run() -> Result<()> {
     // minute. Every store write is its own transaction and the WAL is
     // checkpointed each sync, so exiting from under it is safe.
     drop(sync_thread);
-    let _ = std::fs::remove_file(data_dir.join("kmatrix.port"));
+    ipc::remove_own_port_file(&shared, &data_dir);
     Ok(())
 }
 

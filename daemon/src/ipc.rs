@@ -126,6 +126,34 @@ pub fn listen(sh: &Arc<Shared>) -> Result<TcpListener> {
     Ok(listener)
 }
 
+/// Remove the port file, but only if it is still the one we wrote.
+///
+/// A daemon that finds someone else's port file there has been superseded --
+/// deleting it would leave the live daemon listening behind a file nothing
+/// can read, which looks from the plugin exactly like no daemon at all.
+pub fn remove_own_port_file(sh: &Arc<Shared>, data_dir: &std::path::Path) {
+    let path = data_dir.join("kmatrix.port");
+    let Some(port) = sh.ipc_port.get().copied() else {
+        return;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(body) => {
+            let mine = body
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u16>().ok())
+                .is_some_and(|p| p == port);
+            if mine {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                eprintln!("kmatrixd: leaving the port file, it belongs to another daemon");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("kmatrixd: reading the port file: {e}"),
+    }
+}
+
 pub fn serve(sh: &Arc<Shared>, listener: TcpListener) {
     for conn in listener.incoming() {
         if !sh.running.load(Ordering::SeqCst) {
@@ -583,6 +611,41 @@ mod tests {
 
         drop(reader);
         assert!(wait_for_stop(&sh, joiner), "the real reader leaving did not stop it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon that has been superseded must not delete the port file, which
+    /// by then names somebody else's listener. Reproduced before the fix: a
+    /// second daemon started on the same directory, rewrote the port file to
+    /// its own port, and on the way out deleted it -- leaving the first daemon
+    /// alive and serving behind a file nothing could read, which from the
+    /// plugin is indistinguishable from no daemon at all.
+    #[test]
+    fn a_superseded_daemon_leaves_the_port_file_alone() {
+        let dir = std::env::temp_dir().join(format!("kmatrix-pf-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("kmatrix.port");
+
+        // Ours: same port, so it goes.
+        let sh = shared(&dir);
+        let _ = sh.ipc_port.set(4242);
+        std::fs::write(&path, "4242\ntoken\n").expect("write");
+        remove_own_port_file(&sh, &dir);
+        assert!(!path.exists(), "a daemon must clean up the port file it wrote");
+
+        // Somebody else's: a later daemon rebound and rewrote it.
+        std::fs::write(&path, "5353\nother-token\n").expect("write");
+        remove_own_port_file(&sh, &dir);
+        assert!(
+            path.exists(),
+            "the port file of another daemon must survive our exit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "5353\nother-token\n",
+            "and must be left exactly as it was"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,6 +8,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+# Already in the tree under rusqlite and rand; made direct for flock, which is
+# how one daemon per data directory is enforced.
+libc = "0.2"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
